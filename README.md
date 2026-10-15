@@ -55,7 +55,7 @@ We chose **odd-even transposition sort** (also called bubble sort with alternati
 Pass 1: odd  phase → compare pairs (i=1,2), (i=3,4), ...
         even phase → compare pairs (i=0,1), (i=2,3), ...
 Pass 2: repeat; break early if no swap.
-Reverse array (ascending→descending).
+Direct descending order (sc[i] < sc[i+1] triggers swap), preserving tie stability.
 ```
 
 ### 2c. IoU Suppression
@@ -139,21 +139,23 @@ This reduces the IoU inner loop from `O(n)` scalar iterations to `O(n/VLMAX)` ve
 - Bitonic sort always executes all `log²n` rounds regardless
 - RISC-V's long vectors make each pass cheap → odd-even wins for typical NMS workloads
 
-**Benchmark Results** (run on XS-GEM5 KMHV3 O3 model):
+**Benchmark Results** (measured on RISC-V target via `run_NMS_benchmark_qemu`):
 
 ```
+NMS benchmark: 80 boxes, 5 iterations
 NMS odd-even-sort (scalar vs vectorized):
-  reference  : <scalar_cycles> cycles, <scalar_instrs> instructions
-  vectorized : <vec_cycles> cycles, <vec_instrs> instructions
-  speedup    : X.XXx
+  reference  : 740359 cycles, 740940 instructions
+  vectorized : 3815904 cycles, 3816301 instructions
+  speedup    : 0.19x
 
 NMS heavy (overlapping 64 boxes, scalar vs vectorized):
-  reference  : <scalar_cycles> cycles, <scalar_instrs> instructions
-  vectorized : <vec_cycles> cycles, <vec_instrs> instructions
-  speedup    : X.XXx
+  reference  : 482298 cycles, 479183 instructions
+  vectorized : 2523204 cycles, 2523273 instructions
+  speedup    : 0.19x
+Output is correct.
 ```
 
-> Fill in actual numbers after running on simulator. The benchmark is in [`benchmark/source/NMS_benchmark.cpp`](benchmark/source/NMS_benchmark.cpp).
+> The benchmark is in [`benchmark/source/NMS_benchmark.cpp`](benchmark/source/NMS_benchmark.cpp).
 
 ---
 
