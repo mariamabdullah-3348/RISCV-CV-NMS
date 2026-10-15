@@ -59,10 +59,10 @@ namespace
         {
             bool swapped = false;
 
-            // Odd phase: compare pairs (0,1), (2,3), (4,5), ...
+            // Odd phase: compare pairs (1,2), (3,4), ...
             for (int i = 1; i < n - 1; i += 2)
             {
-                if (scores[indices[i]] > scores[indices[i + 1]])
+                if (scores[indices[i]] < scores[indices[i + 1]])
                 {
                     const int tmp = indices[i];
                     indices[i] = indices[i + 1];
@@ -71,10 +71,10 @@ namespace
                 }
             }
 
-            // Even phase: compare pairs (1,2), (3,4), (5,6), ...
+            // Even phase: compare pairs (0,1), (2,3), ...
             for (int i = 0; i < n - 1; i += 2)
             {
-                if (scores[indices[i]] > scores[indices[i + 1]])
+                if (scores[indices[i]] < scores[indices[i + 1]])
                 {
                     const int tmp = indices[i];
                     indices[i] = indices[i + 1];
@@ -85,13 +85,6 @@ namespace
 
             if (!swapped)
                 break;
-        }
-        // Result is ascending; reverse for descending (highest score first).
-        for (int lo = 0, hi = n - 1; lo < hi; ++lo, --hi)
-        {
-            const int tmp = indices[lo];
-            indices[lo] = indices[hi];
-            indices[hi] = tmp;
         }
     }
 } // namespace
