@@ -1,9 +1,7 @@
 #include "NMS.hpp"
 
-#include <algorithm>
+#include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <vector>
 
 // Scalar educational NonMaxSuppression.
 // Algorithm (ONNX NonMaxSuppression-11, corners-only):
