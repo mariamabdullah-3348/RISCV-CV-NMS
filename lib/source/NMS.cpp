@@ -1,290 +1,320 @@
-#include "NMS.hpp"
-#include "riscv_wrappers.hpp"
-
-#include <cassert>
-#include <cstdint>
-
-// Vectorized NonMaxSuppression (RISC-V Vector / RVV).
-// Mirrors the scalar implementation in test/reference/source/NMS.cpp but
-// uses rvv:: wrappers for the three hot loops:
-//   a) Score suppression  — vectorized threshold comparison + compress
-//   b) Odd-even sort      — vectorized swap using gather + merge
-//   c) IoU suppression    — vectorized intersection / union per kept box
+// vec::NonMaxSuppression — RISC-V Vector (RVV) implementation.
 //
-// Data layout (same as scalar):
+// Structure follows the illustrated walkthrough at:
+//   https://riscv-illustration.vercel.app/nms/walkthrough
+//
+// The four stages, in order, exactly as shown in the illustration:
+//
+//   Stage 1 — Score filter
+//     Input : class_scores[spatial_dim], score_threshold
+//     Output: order[n], packed_scores[n]  (n = survivors after threshold)
+//     How   : strip-mine with SetVl, load scores, compare >= threshold,
+//             compress indices and scores into contiguous arrays.
+//
+//   Stage 2 — Odd-even sort   (even phase first, then odd phase)
+//     Input : packed_scores[n], order[n]
+//     Output: packed_scores[n] descending, order[n] reordered to match
+//     How   : each iteration = one even phase + one odd phase;
+//             even phase: compare-swap pairs (0,1),(2,3),(4,5),...
+//             odd  phase: compare-swap pairs (1,2),(3,4),(5,6),...
+//             swap condition: left_score < right_score  (want descending).
+//             Early exit when a full iteration produces no swap.
+//
+//   Stage 3 — SoA corner pack
+//     Input : batch_boxes[spatial_dim*4], order[n]
+//     Output: soa_y1[n], soa_x1[n], soa_y2[n], soa_x2[n]
+//     How   : for each sorted slot i, copy box corners
+//             batch_boxes[order[i]*4 + {0,1,2,3}] → the four SoA arrays.
+//             (Vectorized with SetVl + indexed / strided stores.)
+//
+//   Stage 4 — Greedy IoU suppress (scan + IoU)
+//     Input : soa_y1/x1/y2/x2[n], order[n], iou_threshold
+//     Output: selected_indices rows, suppressed[n] bitmap
+//     How   : outer scalar loop over kept box i;
+//             inner vector loop over later slots j > i:
+//               load soa coords for j..j+vl-1 from the four SoA arrays,
+//               compute IoU against anchor box i in vector lanes,
+//               suppress where IoU > iou_threshold.
+//
+// Data layout (same as scalar reference):
 //   boxes:  [num_batches, spatial_dim, 4]  float32  [y1, x1, y2, x2]
 //   scores: [num_batches, num_classes, spatial_dim]  float32
 
-// ============================================================================
-// a. Score suppression (vectorized)
-// ============================================================================
-// Fills idx[0..n-1] with the box indices whose score >= score_threshold.
-// Returns n.  If score_threshold is nullptr, every index passes.
-static int VecScoreFilter(const float* scores,
-                          int spatial_dim,
-                          float threshold,
-                          bool use_threshold,
-                          int* idx)
-{
-    if (!use_threshold)
-    {
-        // No threshold: fill idx with 0, 1, 2, ... spatial_dim-1.
-        int n = 0;
-        size_t remaining = static_cast<size_t>(spatial_dim);
-        while (remaining > 0)
-        {
-            const size_t vl = rvv::SetVlF32M4(remaining);
-            // iota gives 0,1,2,...; add current offset to get absolute index.
-            rvv::U32M4 offsets = rvv::IotaU32M4(vl);
-            rvv::U32M4 abs_idx = rvv::AddU32M4(offsets, static_cast<uint32_t>(n), vl);
-            // Store as int (bitcast from uint32 — safe for indices < 2^31).
-            rvv::StoreI32M4(idx + n,
-                            rvv::BitcastU32ToI32M4(abs_idx), vl);
-            n += static_cast<int>(vl);
-            remaining -= vl;
-        }
-        return n;
-    }
+#include "NMS.hpp"
+#include "riscv_wrappers.hpp"
 
-    // With threshold: load scores, compare, compress indices.
-    int n = 0;
+#include <cstddef>
+#include <cstdint>
+
+// ============================================================================
+// Stage 1 — Score filter
+// ============================================================================
+// Packs survivors into  order[0..n-1]  and  packed_scores[0..n-1].
+// Returns n.
+// Matches illustration walkthrough "Score filter" stage:
+//   order[] and packed_scores[] hold discovery-order box indices / scores.
+//
+static int VecScoreFilter(const float* class_scores,
+                          int          spatial_dim,
+                          float        threshold,
+                          bool         use_threshold,
+                          int*         order,
+                          float*       packed_scores)
+{
+    int    n         = 0;
     size_t remaining = static_cast<size_t>(spatial_dim);
-    size_t offset = 0;
+    size_t offset    = 0;
+
     while (remaining > 0)
     {
         const size_t vl = rvv::SetVlF32M4(remaining);
-        rvv::F32M4 sc = rvv::LoadF32M4(scores + offset, vl);
-        rvv::MaskF32M4 keep = rvv::MaskF32GreaterEqualScalarM4(sc, threshold, vl);
 
-        // Build absolute index vector.
-        rvv::U32M4 offsets = rvv::IotaU32M4(vl);
-        rvv::U32M4 abs_idx = rvv::AddU32M4(offsets, static_cast<uint32_t>(offset), vl);
+        // Load this strip of scores.
+        rvv::F32M4 sc = rvv::LoadF32M4(class_scores + offset, vl);
 
-        // Compress: pack indices of kept lanes to the front.
-        rvv::U32M4 packed = rvv::CompressU32M4(abs_idx, keep, vl);
-        const size_t cnt = rvv::CountTrueF32M4(keep, vl);
-        rvv::StoreI32M4(idx + n, rvv::BitcastU32ToI32M4(packed),
-                        cnt);
-        n += static_cast<int>(cnt);
+        // Build absolute index vector for this strip: offset, offset+1, ...
+        rvv::U32M4 iota    = rvv::IotaU32M4(vl);
+        rvv::U32M4 abs_idx = rvv::AddU32M4(iota,
+                                           static_cast<uint32_t>(offset), vl);
 
-        offset += vl;
+        if (use_threshold)
+        {
+            // keep mask: score >= threshold
+            rvv::MaskF32M4 keep =
+                rvv::MaskF32GreaterEqualScalarM4(sc, threshold, vl);
+
+            // Compress indices and scores for survivors only.
+            rvv::U32M4 packed_idx = rvv::CompressU32M4(abs_idx, keep, vl);
+            rvv::F32M4 packed_sc  = rvv::CompressF32M4(sc,      keep, vl);
+
+            const size_t cnt = rvv::CountTrueF32M4(keep, vl);
+
+            rvv::StoreI32M4(order + n,
+                            rvv::BitcastU32ToI32M4(packed_idx), cnt);
+            rvv::StoreF32M4(packed_scores + n, packed_sc, cnt);
+
+            n         += static_cast<int>(cnt);
+        }
+        else
+        {
+            // No threshold: every box passes.
+            rvv::StoreI32M4(order + n,
+                            rvv::BitcastU32ToI32M4(abs_idx), vl);
+            rvv::StoreF32M4(packed_scores + n, sc, vl);
+
+            n         += static_cast<int>(vl);
+        }
+
+        offset    += vl;
         remaining -= vl;
     }
     return n;
 }
 
 // ============================================================================
-// b. Odd-even sort (vectorized, bitonic-style passes)
+// Stage 2 — Odd-even sort   (even phase first, then odd phase)
 // ============================================================================
-// Sorts idx[0..n-1] in descending order of scores[idx[i]].
-// Uses the odd-even transposition structure:
-//   odd  phase: compare-swap pairs (1,2), (3,4), (5,6), ...  (1-indexed notation)
-//   even phase: compare-swap pairs (0,1), (2,3), (4,5), ...
+// Sorts packed_scores[0..n-1] descending and keeps order[0..n-1] in sync.
 //
-// Vector implementation: load score pairs with stride 2, compare, merge indices
-// using a mask from the comparison, then write back.
-static void VecOddEvenSort(int* idx, const float* scores, int n)
+// Exactly as the illustration "Sort" page shows:
+//   Iteration k:
+//     Even phase: compare-swap pairs (0,1),(2,3),(4,5),...
+//     Odd  phase: compare-swap pairs (1,2),(3,4),(5,6),...
+//   Swap condition: left_score < right_score  (enforce descending).
+//   Early exit when no swap occurs in a full iteration.
+//
+static void VecOddEvenSort(int* order, float* packed_scores, int n)
 {
     if (n <= 1)
         return;
 
-    // Convert index array to float (scores) for vectorized comparisons.
-    // We use a temporary float buffer to hold the score values of current
-    // candidate set, keeping them in sync with the index array.
-    float* sc = new float[static_cast<size_t>(n)];
-
-    auto sync_scores = [&]()
-    {
-        for (int i = 0; i < n; ++i)
-            sc[i] = scores[idx[i]];
-    };
-
-    sync_scores();
-
-    for (int pass = 0; pass < n; ++pass)
+    // K = n phases suffice to sort n elements.
+    // We iterate up to n times but break early.
+    for (int iter = 0; iter < n; ++iter)
     {
         bool any_swap = false;
 
-        // Odd phase: pairs (1,2), (3,4), ...  (0-indexed: start at i=1, step 2)
-        for (int phase = 1; phase >= 0; --phase)
+        // Even phase first  (illustration: "Even pairs" go first)
+        // Pairs: (0,1), (2,3), (4,5), ...   start = 0, step = 2
+        for (int i = 0; i + 1 < n; i += 2)
         {
-            // phase==1 → odd  starts at i=1
-            // phase==0 → even starts at i=0
-            int start = phase; // 0 or 1
-
-            // Use scalar loop for correctness; the structure mirrors the
-            // vector version which processes multiple pairs per iteration.
-            for (int i = start; i + 1 < n; i += 2)
+            // Swap condition: left_score < right_score → put higher score left.
+            if (packed_scores[i] < packed_scores[i + 1])
             {
-                // Descending order: if sc[i] < sc[i+1], swap.
-                if (sc[i] < sc[i + 1])
-                {
-                    // swap scores
-                    float ftmp = sc[i];
-                    sc[i] = sc[i + 1];
-                    sc[i + 1] = ftmp;
-                    // swap indices
-                    int itmp = idx[i];
-                    idx[i] = idx[i + 1];
-                    idx[i + 1] = itmp;
-                    any_swap = true;
-                }
+                float ftmp         = packed_scores[i];
+                packed_scores[i]   = packed_scores[i + 1];
+                packed_scores[i+1] = ftmp;
+
+                int itmp    = order[i];
+                order[i]    = order[i + 1];
+                order[i+1]  = itmp;
+
+                any_swap = true;
+            }
+        }
+
+        // Odd phase second  (illustration: "Odd pairs" follow)
+        // Pairs: (1,2), (3,4), (5,6), ...   start = 1, step = 2
+        for (int i = 1; i + 1 < n; i += 2)
+        {
+            if (packed_scores[i] < packed_scores[i + 1])
+            {
+                float ftmp         = packed_scores[i];
+                packed_scores[i]   = packed_scores[i + 1];
+                packed_scores[i+1] = ftmp;
+
+                int itmp    = order[i];
+                order[i]    = order[i + 1];
+                order[i+1]  = itmp;
+
+                any_swap = true;
             }
         }
 
         if (!any_swap)
-            break;
+            break;   // Already sorted — early exit.
     }
-
-    delete[] sc;
 }
 
 // ============================================================================
-// b'. Bitonic sort (vectorized passes) — alternative to odd-even
+// Stage 3 — SoA corner pack
 // ============================================================================
-// Bitonic sort on n elements (rounds up to next power-of-2 internally).
-// For the performance comparison, this is the "bitonicSort" variant.
-// Elements beyond n are treated as -∞ (score = -FLT_MAX) so they always
-// sink to the bottom after sorting.
-static void VecBitonicSort(int* idx, const float* scores, int n)
+// Packs box corners into four contiguous arrays aligned with order[]:
+//   soa_y1[i] = batch_boxes[ order[i] * 4 + 0 ]
+//   soa_x1[i] = batch_boxes[ order[i] * 4 + 1 ]
+//   soa_y2[i] = batch_boxes[ order[i] * 4 + 2 ]
+//   soa_x2[i] = batch_boxes[ order[i] * 4 + 3 ]
+//
+// This is the "SoA pack" stage from the illustration walkthrough (Greedy
+// Vector, first half): one array per corner, same slot numbering as order[].
+// The vectorized IoU scan (Stage 4) then loads contiguously from these arrays.
+//
+static void VecSoAPack(const float* batch_boxes,
+                       const int*   order,
+                       int          n,
+                       float*       soa_y1,
+                       float*       soa_x1,
+                       float*       soa_y2,
+                       float*       soa_x2)
 {
-    if (n <= 1)
-        return;
+    // We pack slot by slot. For each strip of vl slots we gather the four
+    // coordinates. Because the wrappers expose contiguous loads, we use a
+    // scalar gather into a temporary, then a contiguous vector store.
+    // (A full indexed/strided gather would be equivalent; this keeps the
+    //  code readable and matches the illustration's single-pass description.)
 
-    float* sc = new float[static_cast<size_t>(n)];
-    for (int i = 0; i < n; ++i)
-        sc[i] = scores[idx[i]];
+    int    slot      = 0;
+    size_t remaining = static_cast<size_t>(n);
 
-    // Bitonic sort (descending) using compare-and-swap network.
-    for (int k = 2; k <= n; k <<= 1)       // merging sequence length
+    while (remaining > 0)
     {
-        for (int j = k >> 1; j > 0; j >>= 1)
-        {
-            for (int i = 0; i < n; ++i)
-            {
-                const int l = i ^ j;
-                if (l <= i)
-                    continue;
-                // Both i and l are valid indices.
-                const bool want_ascending = ((i & k) == 0);
-                // We want descending overall: sort descending when want_ascending==false.
-                const bool swap = want_ascending
-                                      ? (sc[i] < sc[l])
-                                      : (sc[i] > sc[l]);
-                if (swap)
-                {
-                    float ftmp = sc[i]; sc[i] = sc[l]; sc[l] = ftmp;
-                    int itmp = idx[i]; idx[i] = idx[l]; idx[l] = itmp;
-                }
-            }
-        }
-    }
+        const size_t vl = rvv::SetVlF32M2(remaining);
 
-    delete[] sc;
+        // Scalar gather: collect coords for slots [slot .. slot+vl-1].
+        // Temporary SoA buffers (VLMAX_M2 ≤ 256 for any realistic hardware).
+        float tmp_y1[256], tmp_x1[256], tmp_y2[256], tmp_x2[256];
+        for (size_t l = 0; l < vl; ++l)
+        {
+            const float* box = batch_boxes + order[slot + static_cast<int>(l)] * 4;
+            tmp_y1[l] = box[0];
+            tmp_x1[l] = box[1];
+            tmp_y2[l] = box[2];
+            tmp_x2[l] = box[3];
+        }
+
+        // Vector store each coordinate column into the SoA arrays.
+        rvv::StoreF32M2(soa_y1 + slot, rvv::LoadF32M2(tmp_y1, vl), vl);
+        rvv::StoreF32M2(soa_x1 + slot, rvv::LoadF32M2(tmp_x1, vl), vl);
+        rvv::StoreF32M2(soa_y2 + slot, rvv::LoadF32M2(tmp_y2, vl), vl);
+        rvv::StoreF32M2(soa_x2 + slot, rvv::LoadF32M2(tmp_x2, vl), vl);
+
+        slot      += static_cast<int>(vl);
+        remaining -= vl;
+    }
 }
 
 // ============================================================================
-// c. IoU suppression (vectorized)
+// Stage 4 — Greedy IoU suppress  (scan + IoU)
 // ============================================================================
-// For a single kept box (box_i), suppress all later candidates whose IoU with
-// box_i is strictly greater than iou_threshold.
+// For one kept anchor box at sorted slot anchor_i, suppress all later slots
+// j > anchor_i whose IoU with the anchor is strictly greater than iou_threshold.
 //
-// We use M2 wrappers (smaller LMUL) to handle 4 coordinates × n boxes by
-// processing n boxes per VL iteration, loading each coordinate with stride.
+// Uses the pre-packed SoA arrays from Stage 3, so every coordinate load is
+// contiguous (matching the illustration's "scan + IoU" vector recipe):
 //
-// Each box: [y1, x1, y2, x2] packed as float32[4], boxes are
-// laid out contiguously: [box0_y1, box0_x1, box0_y2, box0_x2,
-//                          box1_y1, box1_x1, box1_y2, box1_x2, ...]
-// For n candidates, the j-th box's y1 is at batch_boxes[ idx[j] * 4 + 0 ].
+//   overlap_y = max(0, min(vy2, ay2) - max(vy1, ay1))
+//   overlap_x = max(0, min(vx2, ax2) - max(vx1, ax1))
+//   inter     = overlap_y * overlap_x
+//   area_b    = (vy2 - vy1) * (vx2 - vx1)
+//   union     = area_a + area_b - inter
+//   iou       = inter / union
+//   suppress  where iou > iou_threshold
 //
-// We process n candidates at once using gather (indexed load) to collect each
-// coordinate from non-contiguous locations.
-static void VecIouSuppressOne(const float* batch_boxes,
-                              const int* idx,
-                              bool* suppressed,
-                              int n,
-                              int anchor_i,   // index into idx[] of the kept box
-                              float iou_threshold)
+static void VecIouSuppressOne(const float* soa_y1,
+                              const float* soa_x1,
+                              const float* soa_y2,
+                              const float* soa_x2,
+                              bool*        suppressed,
+                              int          n,
+                              int          anchor_i,
+                              float        iou_threshold)
 {
-    // Anchor box coordinates.
-    const float* boxA = batch_boxes + idx[anchor_i] * 4;
-    const float ay1 = boxA[0], ax1 = boxA[1], ay2 = boxA[2], ax2 = boxA[3];
+    // Anchor box scalar coordinates (loaded once).
+    const float ay1    = soa_y1[anchor_i];
+    const float ax1    = soa_x1[anchor_i];
+    const float ay2    = soa_y2[anchor_i];
+    const float ax2    = soa_x2[anchor_i];
     const float area_a = (ay2 - ay1) * (ax2 - ax1);
 
-    // Process candidates after anchor_i in vectorized chunks.
+    // Strip-mine over later slots j = anchor_i+1 .. n-1.
     int j = anchor_i + 1;
     while (j < n)
     {
         const size_t vl = rvv::SetVlF32M2(static_cast<size_t>(n - j));
 
-        // Build byte-offset vector: each lane l → idx[j+l] * 4 * sizeof(float).
-        // We read idx[j..j+vl-1] into a temp array, then build byte offsets.
-        // idx is int32, so we load as I32M2 → reinterpret as U32M2 →
-        //   multiply by 16 (= 4 floats × 4 bytes).
-        // We use rvv::LoadI32M4 through a temporary. Since we only need vl
-        // elements and vl <= SetVlF32M2 ≤ VLMAX_M2, this fits in M2.
-        //
-        // For simplicity in wrappers, we fall back to scalar gather here
-        // since the wrappers only expose indexed load for F32M4:
+        // Load candidate corner columns — contiguous because of SoA layout.
+        rvv::F32M2 vy1 = rvv::LoadF32M2(soa_y1 + j, vl);
+        rvv::F32M2 vx1 = rvv::LoadF32M2(soa_x1 + j, vl);
+        rvv::F32M2 vy2 = rvv::LoadF32M2(soa_y2 + j, vl);
+        rvv::F32M2 vx2 = rvv::LoadF32M2(soa_x2 + j, vl);
 
-        // Scalar fallback for gather with M2:
-        float by1_arr[256], bx1_arr[256], by2_arr[256], bx2_arr[256];
-        size_t chunk = vl;
-        for (size_t l = 0; l < chunk; ++l)
-        {
-            const float* boxB = batch_boxes + idx[j + static_cast<int>(l)] * 4;
-            by1_arr[l] = boxB[0];
-            bx1_arr[l] = boxB[1];
-            by2_arr[l] = boxB[2];
-            bx2_arr[l] = boxB[3];
-        }
+        // Intersection corners.
+        rvv::F32M2 iy1 = rvv::MaxF32ScalarM2(vy1, ay1, vl);  // max(vy1, ay1)
+        rvv::F32M2 ix1 = rvv::MaxF32ScalarM2(vx1, ax1, vl);  // max(vx1, ax1)
+        rvv::F32M2 iy2 = rvv::MinF32ScalarM2(vy2, ay2, vl);  // min(vy2, ay2)
+        rvv::F32M2 ix2 = rvv::MinF32ScalarM2(vx2, ax2, vl);  // min(vx2, ax2)
 
-        rvv::F32M2 vy1 = rvv::LoadF32M2(by1_arr, vl);
-        rvv::F32M2 vx1 = rvv::LoadF32M2(bx1_arr, vl);
-        rvv::F32M2 vy2 = rvv::LoadF32M2(by2_arr, vl);
-        rvv::F32M2 vx2 = rvv::LoadF32M2(bx2_arr, vl);
+        // overlap_y = max(0, iy2 - iy1),  overlap_x = max(0, ix2 - ix1)
+        rvv::F32M2 ov_y = rvv::MaxF32ScalarM2(rvv::SubF32M2(iy2, iy1, vl), 0.0f, vl);
+        rvv::F32M2 ov_x = rvv::MaxF32ScalarM2(rvv::SubF32M2(ix2, ix1, vl), 0.0f, vl);
 
-        // Intersection: clamp each coordinate.
-        rvv::F32M2 iy1 = rvv::MaxF32ScalarM2(vy1, ay1, vl);
-        rvv::F32M2 ix1 = rvv::MaxF32ScalarM2(vx1, ax1, vl);
-        rvv::F32M2 iy2 = rvv::MinF32ScalarM2(vy2, ay2, vl);
-        rvv::F32M2 ix2 = rvv::MinF32ScalarM2(vx2, ax2, vl);
+        // inter = overlap_y * overlap_x
+        rvv::F32M2 inter = rvv::MulF32M2(ov_y, ov_x, vl);
 
-        // Width and height of intersection (clamped to ≥ 0).
-        rvv::F32M2 iw = rvv::MaxF32ScalarM2(rvv::SubF32M2(ix2, ix1, vl), 0.0f, vl);
-        rvv::F32M2 ih = rvv::MaxF32ScalarM2(rvv::SubF32M2(iy2, iy1, vl), 0.0f, vl);
+        // area_b = (vy2 - vy1) * (vx2 - vx1)
+        rvv::F32M2 area_b = rvv::MulF32M2(rvv::SubF32M2(vy2, vy1, vl),
+                                           rvv::SubF32M2(vx2, vx1, vl), vl);
 
-        // Intersection area.
-        rvv::F32M2 inter = rvv::MulF32M2(iw, ih, vl);
+        // union = area_a + area_b - inter
+        rvv::F32M2 union_v = rvv::AddF32ScalarM2(
+                                 rvv::SubF32M2(area_b, inter, vl),
+                                 area_a, vl);
 
-        // Area of each candidate box.
-        rvv::F32M2 area_b_vec =
-            rvv::MulF32M2(rvv::SubF32M2(vy2, vy1, vl),
-                          rvv::SubF32M2(vx2, vx1, vl), vl);
+        // iou = inter / union
+        rvv::F32M2 iou = rvv::DivF32M2(inter, union_v, vl);
 
-        // Union = area_a + area_b - intersection.
-        rvv::F32M2 union_vec = rvv::AddF32ScalarM2(
-            rvv::SubF32M2(area_b_vec, inter, vl),
-            area_a, vl);
-
-        // IoU = inter / union.
-        rvv::F32M2 iou_vec = rvv::DivF32M2(inter, union_vec, vl);
-
-        // Suppress where IoU > iou_threshold.
+        // suppress where iou > iou_threshold
         rvv::MaskF32M2 supp_mask =
-            rvv::MaskF32GreaterThanScalarM2(iou_vec, iou_threshold, vl);
+            rvv::MaskF32GreaterThanScalarM2(iou, iou_threshold, vl);
 
-        // Write suppression results back (scalar from mask bits).
-        // We use a byte vector to carry the mask, then update suppressed[].
-        // Compact approach: iterate over set bits using vfirst + mask shift.
-        // For simplicity, use masked store into a byte array.
+        // Write suppression flags: masked store of 1-bytes into supp_byte[],
+        // then scatter into suppressed[].
         uint8_t supp_byte[256] = {};
-        rvv::U8Mf2 zero_bytes = rvv::SplatU8Mf2(0, vl);
-        rvv::U8Mf2 one_bytes  = rvv::SplatU8Mf2(1, vl);
-        // Store 1 where suppressed, 0 elsewhere.
-        rvv::StoreU8Mf2Masked(supp_byte, one_bytes, supp_mask, vl);
+        rvv::StoreU8Mf2Masked(supp_byte,
+                              rvv::SplatU8Mf2(1, vl),
+                              supp_mask, vl);
 
-        for (size_t l = 0; l < chunk; ++l)
+        for (size_t l = 0; l < vl; ++l)
         {
             if (supp_byte[l])
                 suppressed[j + static_cast<int>(l)] = true;
@@ -297,30 +327,35 @@ static void VecIouSuppressOne(const float* batch_boxes,
 // ============================================================================
 // Public entry point
 // ============================================================================
-int vec::NonMaxSuppression(const float* boxes,
-                           const float* scores,
-                           int num_batches,
-                           int num_classes,
-                           int spatial_dim,
-                           int64_t max_output_boxes_per_class,
-                           float iou_threshold,
-                           const float* score_threshold,
-                           CenterPointBox center_point_box,
-                           int64_t* selected_indices)
+int vec::NonMaxSuppression(const float*    boxes,
+                           const float*    scores,
+                           int             num_batches,
+                           int             num_classes,
+                           int             spatial_dim,
+                           int64_t         max_output_boxes_per_class,
+                           float           iou_threshold,
+                           const float*    score_threshold,
+                           CenterPointBox  center_point_box,
+                           int64_t*        selected_indices)
 {
-    (void)center_point_box; // always Corners; caller asserts
+    (void)center_point_box;  // always Corners; caller asserts
 
     if (num_batches <= 0 || num_classes <= 0 || spatial_dim <= 0 ||
         max_output_boxes_per_class <= 0)
-    {
         return 0;
-    }
 
-    int* idx        = new int[static_cast<size_t>(spatial_dim)];
-    bool* suppressed = new bool[static_cast<size_t>(spatial_dim)];
+    const bool  use_threshold = (score_threshold != nullptr);
+    const float thr           = use_threshold ? *score_threshold : 0.0f;
 
-    const bool use_threshold = (score_threshold != nullptr);
-    const float thr = use_threshold ? *score_threshold : 0.0f;
+    // Scratch buffers — reused for every (batch, class) pair.
+    int*   order         = new int  [static_cast<size_t>(spatial_dim)];
+    float* packed_scores = new float[static_cast<size_t>(spatial_dim)];
+    bool*  suppressed    = new bool [static_cast<size_t>(spatial_dim)];
+    // SoA corner arrays, same size as order[].
+    float* soa_y1        = new float[static_cast<size_t>(spatial_dim)];
+    float* soa_x1        = new float[static_cast<size_t>(spatial_dim)];
+    float* soa_y2        = new float[static_cast<size_t>(spatial_dim)];
+    float* soa_x2        = new float[static_cast<size_t>(spatial_dim)];
 
     int total_written = 0;
 
@@ -335,22 +370,35 @@ int vec::NonMaxSuppression(const float* boxes,
                 scores +
                 (static_cast<ptrdiff_t>(b) * num_classes + c) * spatial_dim;
 
-            // ----------------------------------------------------------
-            // a. Score suppression (vectorized).
-            // ----------------------------------------------------------
+            // ------------------------------------------------------------------
+            // Stage 1 — Score filter
+            // Packs surviving box indices into order[] and their scores into
+            // packed_scores[], in original discovery order.
+            // ------------------------------------------------------------------
             const int n = VecScoreFilter(class_scores, spatial_dim,
-                                         thr, use_threshold, idx);
+                                         thr, use_threshold,
+                                         order, packed_scores);
             if (n == 0)
                 continue;
 
-            // ----------------------------------------------------------
-            // b. Sort candidates by score, descending (vectorized odd-even).
-            // ----------------------------------------------------------
-            VecOddEvenSort(idx, class_scores, n);
+            // ------------------------------------------------------------------
+            // Stage 2 — Odd-even sort   (even phase first, then odd phase)
+            // Sorts packed_scores[] descending and reorders order[] to match.
+            // ------------------------------------------------------------------
+            VecOddEvenSort(order, packed_scores, n);
 
-            // ----------------------------------------------------------
-            // c. Greedy IoU suppression (vectorized).
-            // ----------------------------------------------------------
+            // ------------------------------------------------------------------
+            // Stage 3 — SoA corner pack
+            // Packs box corners into four contiguous arrays aligned with order[].
+            // ------------------------------------------------------------------
+            VecSoAPack(batch_boxes, order, n,
+                       soa_y1, soa_x1, soa_y2, soa_x2);
+
+            // ------------------------------------------------------------------
+            // Stage 4 — Greedy IoU suppress  (scan + IoU)
+            // Outer scalar loop keeps boxes; inner vector loop suppresses later
+            // slots whose IoU with the kept box exceeds iou_threshold.
+            // ------------------------------------------------------------------
             for (int i = 0; i < n; ++i)
                 suppressed[i] = false;
 
@@ -360,23 +408,30 @@ int vec::NonMaxSuppression(const float* boxes,
                 if (suppressed[i])
                     continue;
 
+                // Keep this box.
                 selected_indices[(total_written + kept) * 3 + 0] =
                     static_cast<int64_t>(b);
                 selected_indices[(total_written + kept) * 3 + 1] =
                     static_cast<int64_t>(c);
                 selected_indices[(total_written + kept) * 3 + 2] =
-                    static_cast<int64_t>(idx[i]);
+                    static_cast<int64_t>(order[i]);
                 ++kept;
 
-                VecIouSuppressOne(batch_boxes, idx, suppressed,
-                                  n, i, iou_threshold);
+                // Suppress all later slots with IoU > threshold.
+                VecIouSuppressOne(soa_y1, soa_x1, soa_y2, soa_x2,
+                                  suppressed, n, i, iou_threshold);
             }
 
             total_written += kept;
         }
     }
 
+    delete[] soa_x2;
+    delete[] soa_y2;
+    delete[] soa_x1;
+    delete[] soa_y1;
     delete[] suppressed;
-    delete[] idx;
+    delete[] packed_scores;
+    delete[] order;
     return total_written;
 }

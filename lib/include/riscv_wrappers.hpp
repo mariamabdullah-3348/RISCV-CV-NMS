@@ -195,6 +195,11 @@ namespace rvv
         return __riscv_vle32_v_f32m2(src, vl);
     }
 
+    inline void StoreF32M2(float* dst, F32M2 values, size_t vl)
+    {
+        __riscv_vse32_v_f32m2(dst, values, vl);
+    }
+
     inline U8Mf2 LoadU8Mf2(const uint8_t* src, size_t vl)
     {
         return __riscv_vle8_v_u8mf2(src, vl);
