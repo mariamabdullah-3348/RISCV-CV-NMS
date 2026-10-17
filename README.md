@@ -189,11 +189,29 @@ cmake --build build --target run_NMS_test_qemu
 cmake --build build --target run_unit_tests_qemu
 ```
 
-### Run benchmark
+### Running Individual Benchmarks (Separate QEMU & GEM5 Stats)
+
+To inspect performance counters, cycles, instructions, and gem5 `stats.txt` independently for each experiment, each test has its own target:
+
+| Experiment | QEMU Run Target | GEM5 Run Target (Writes `stats.txt`) |
+|---|---|---|
+| **1. Standard NMS (Scalar vs. Vector)** | `run_NMS_scalar_vs_vector_benchmark_qemu` | `run_NMS_scalar_vs_vector_benchmark_gem5` |
+| **2. Dense NMS (64 Overlapping Boxes)** | `run_NMS_heavy_benchmark_qemu` | `run_NMS_heavy_benchmark_gem5` |
+| **3. Scalar Sort (Odd-Even vs. Bitonic)** | `run_NMS_scalar_sort_benchmark_qemu` | `run_NMS_scalar_sort_benchmark_gem5` |
+| **4. Vector Sort (Odd-Even vs. Bitonic)** | `run_NMS_vector_sort_benchmark_qemu` | `run_NMS_vector_sort_benchmark_gem5` |
+| **All Experiments Combined** | `run_NMS_benchmark_qemu` | `run_NMS_benchmark_gem5` |
 
 ```bash
-cmake --build build --target NMS_benchmark_qemu
-cmake --build build --target run_NMS_benchmark_qemu
+# Run any individual experiment on QEMU:
+cmake --build build --target run_NMS_scalar_vs_vector_benchmark_qemu
+cmake --build build --target run_NMS_scalar_sort_benchmark_qemu
+cmake --build build --target run_NMS_vector_sort_benchmark_qemu
+cmake --build build --target run_NMS_heavy_benchmark_qemu
+
+# Run any individual experiment on GEM5 to generate its isolated stats.txt:
+cmake --build build --target run_NMS_scalar_sort_benchmark_gem5
+# Dedicated stats output location:
+# build/benchmark/NMS_scalar_sort_benchmark_gem5-m5out/stats.txt
 ```
 
 ### Golden Reference (Python)
