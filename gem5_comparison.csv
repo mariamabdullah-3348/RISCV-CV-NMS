@@ -1,0 +1,5 @@
+comparison,baseline_cycles,comparison_cycles,speedup
+Bitonic vs scalar odd-even,1475436.0,1559834.0,0.945892960404761
+Bitonic vs RVV odd-even,3167247.0,3672557.0,0.8624092151599009
+RVV vs scalar odd-even,1475436.0,3167247.0,0.4658417862579079
+RVV vs scalar bitonic,1559834.0,3672557.0,0.42472696815869704

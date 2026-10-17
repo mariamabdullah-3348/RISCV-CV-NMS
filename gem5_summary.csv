@@ -1,0 +1,5 @@
+run,stats_file,simTicks,simSeconds,hostSeconds,simInsts,system.cpu.numCycles,system.cpu.ipc,system.cpu.cpi
+scalar_odd_even,/mnt/c/Embedded/RISCV-CV-NMS-gem5-separate-runs/RISCV-CV-NMS/build/benchmark/NMS_scalar_odd_even_gem5-m5out/stats.txt,491319855.0,0.000491,50.03,2567141.0,1475436.0,1.73992,0.574739
+scalar_bitonic,/mnt/c/Embedded/RISCV-CV-NMS-gem5-separate-runs/RISCV-CV-NMS/build/benchmark/NMS_scalar_bitonic_gem5-m5out/stats.txt,519424389.0,0.000519,52.16,2621498.0,1559834.0,1.680626,0.595016
+rvv_odd_even,/mnt/c/Embedded/RISCV-CV-NMS-gem5-separate-runs/RISCV-CV-NMS/build/benchmark/NMS_rvv_odd_even_gem5-m5out/stats.txt,1054692918.0,0.001055,48.57,1689130.0,3167247.0,0.533312,1.875076
+rvv_bitonic,/mnt/c/Embedded/RISCV-CV-NMS-gem5-separate-runs/RISCV-CV-NMS/build/benchmark/NMS_rvv_bitonic_gem5-m5out/stats.txt,1222961148.0,0.001223,44.89,1571973.0,3672557.0,0.428032,2.336272
