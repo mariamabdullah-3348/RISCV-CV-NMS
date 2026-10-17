@@ -88,8 +88,26 @@ namespace
     // Bitonic sort (descending order)
     void BitonicSort(int* indices, const float* scores, int n)
     {
+        if (n <= 1)
+            return;
+
         int p = 1;
         while (p < n) p <<= 1;
+        float* padded_scores = new float[static_cast<size_t>(p)];
+        int* padded_indices = new int[static_cast<size_t>(p)];
+        for (int i = 0; i < p; ++i)
+        {
+            if (i < n)
+            {
+                padded_indices[i] = indices[i];
+                padded_scores[i] = scores[indices[i]];
+            }
+            else
+            {
+                padded_indices[i] = -1;
+                padded_scores[i] = -__builtin_inff();
+            }
+        }
 
         for (int k = 2; k <= p; k <<= 1)
         {
@@ -97,25 +115,33 @@ namespace
             {
                 for (int i = 0; i < p; ++i)
                 {
-                    int l = i ^ j;
+                    const int l = i ^ j;
                     if (l > i)
                     {
-                        bool dir_descending = ((i & k) == 0);
-                        if (l < n)
+                        const bool descending = ((i & k) == 0);
+                        const bool equal_score = padded_scores[i] == padded_scores[l];
+                        const bool swap = descending
+                            ? (padded_scores[i] < padded_scores[l] ||
+                               (equal_score && padded_indices[i] > padded_indices[l]))
+                            : (padded_scores[i] > padded_scores[l] ||
+                               (equal_score && padded_indices[i] < padded_indices[l]));
+                        if (swap)
                         {
-                            bool should_swap = dir_descending ? (scores[indices[i]] < scores[indices[l]])
-                                                              : (scores[indices[i]] > scores[indices[l]]);
-                            if (should_swap)
-                            {
-                                const int tmp = indices[i];
-                                indices[i] = indices[l];
-                                indices[l] = tmp;
-                            }
+                            const float fs = padded_scores[i];
+                            padded_scores[i] = padded_scores[l];
+                            padded_scores[l] = fs;
+                            const int ix = padded_indices[i];
+                            padded_indices[i] = padded_indices[l];
+                            padded_indices[l] = ix;
                         }
                     }
                 }
             }
         }
+        for (int i = 0; i < n; ++i)
+            indices[i] = padded_indices[i];
+        delete[] padded_indices;
+        delete[] padded_scores;
     }
 
     int NonMaxSuppressionImpl(const float* boxes,

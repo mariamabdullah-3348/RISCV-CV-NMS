@@ -103,6 +103,26 @@ namespace rvv
         return __riscv_vmflt_vv_f32m4_b8(left, right, vl);
     }
 
+    inline MaskF32M4 MaskF32EqualM4(F32M4 left, F32M4 right, size_t vl)
+    {
+        return __riscv_vmfeq_vv_f32m4_b8(left, right, vl);
+    }
+
+    inline MaskF32M4 MaskI32LessThanM4(I32M4 left, I32M4 right, size_t vl)
+    {
+        return __riscv_vmslt_vv_i32m4_b8(left, right, vl);
+    }
+
+    inline MaskF32M4 MaskAndM4(MaskF32M4 left, MaskF32M4 right, size_t vl)
+    {
+        return __riscv_vmand_mm_b8(left, right, vl);
+    }
+
+    inline MaskF32M4 MaskOrM4(MaskF32M4 left, MaskF32M4 right, size_t vl)
+    {
+        return __riscv_vmor_mm_b8(left, right, vl);
+    }
+
     // Lane = mask ? when_true : when_false.
     inline F32M4 MergeF32M4(F32M4 when_false, F32M4 when_true, MaskF32M4 mask, size_t vl)
     {

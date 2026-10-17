@@ -105,6 +105,41 @@ TEST(NMSTest, VectorizedMatchesReference)
 }
 
 // Larger than a typical e32m4/e32m2 VL so compress, odd-even, and IoU tails run.
+
+TEST(NMSTest, ScalarBitonicMatchesOnnxGolden)
+{
+    for (int i = 0; i < kNMSOnnxCaseCount; i++)
+    {
+        const NMSOnnxCase& test_case = kNMSOnnxCases[i];
+        int64_t* actual = new int64_t[OutputRows(test_case) * 3];
+        const int actual_count = ref::NonMaxSuppressionBitonic(
+            test_case.boxes, test_case.scores, test_case.num_batches,
+            test_case.num_classes, test_case.spatial_dim,
+            test_case.max_output_boxes_per_class, test_case.iou_threshold,
+            test_case.score_threshold, test_case.center_point_box, actual);
+        ExpectSelectedIndicesEqual(test_case.expected_indices, actual,
+                                   test_case.expected_count, actual_count);
+        delete[] actual;
+    }
+}
+
+TEST(NMSTest, VectorizedBitonicMatchesOnnxGolden)
+{
+    for (int i = 0; i < kNMSOnnxCaseCount; i++)
+    {
+        const NMSOnnxCase& test_case = kNMSOnnxCases[i];
+        int64_t* actual = new int64_t[OutputRows(test_case) * 3];
+        const int actual_count = vec::NonMaxSuppressionBitonic(
+            test_case.boxes, test_case.scores, test_case.num_batches,
+            test_case.num_classes, test_case.spatial_dim,
+            test_case.max_output_boxes_per_class, test_case.iou_threshold,
+            test_case.score_threshold, test_case.center_point_box, actual);
+        ExpectSelectedIndicesEqual(test_case.expected_indices, actual,
+                                   test_case.expected_count, actual_count);
+        delete[] actual;
+    }
+}
+
 TEST(NMSTest, VectorizedMatchesReferenceManyBoxes)
 {
     const int box_count = 80;
@@ -122,6 +157,7 @@ TEST(NMSTest, VectorizedMatchesReferenceManyBoxes)
     const float score_threshold = 0.0f;
     int64_t* expected = new int64_t[static_cast<size_t>(box_count) * 3];
     int64_t* actual = new int64_t[static_cast<size_t>(box_count) * 3];
+    int64_t* actual_bitonic = new int64_t[static_cast<size_t>(box_count) * 3];
 
     const int expected_count = ref::NonMaxSuppression(
         boxes, scores, 1, 1, box_count, box_count, 0.5f, &score_threshold,
@@ -129,8 +165,12 @@ TEST(NMSTest, VectorizedMatchesReferenceManyBoxes)
     const int actual_count = vec::NonMaxSuppression(
         boxes, scores, 1, 1, box_count, box_count, 0.5f, &score_threshold,
         CenterPointBox::Corners, actual);
+    const int actual_bitonic_count = vec::NonMaxSuppressionBitonic(
+        boxes, scores, 1, 1, box_count, box_count, 0.5f, &score_threshold,
+        CenterPointBox::Corners, actual_bitonic);
 
     ExpectSelectedIndicesEqual(expected, actual, expected_count, actual_count);
+    ExpectSelectedIndicesEqual(expected, actual_bitonic, expected_count, actual_bitonic_count);
 
     for (int i = 0; i < box_count; i++)
     {
@@ -146,8 +186,13 @@ TEST(NMSTest, VectorizedMatchesReferenceManyBoxes)
     const int actual_identical = vec::NonMaxSuppression(
         boxes, scores, 1, 1, box_count, 5, 0.5f, &score_threshold,
         CenterPointBox::Corners, actual);
+    const int actual_identical_bitonic = vec::NonMaxSuppressionBitonic(
+        boxes, scores, 1, 1, box_count, 5, 0.5f, &score_threshold,
+        CenterPointBox::Corners, actual_bitonic);
     ExpectSelectedIndicesEqual(expected, actual, expected_identical, actual_identical);
+    ExpectSelectedIndicesEqual(expected, actual_bitonic, expected_identical, actual_identical_bitonic);
 
+    delete[] actual_bitonic;
     delete[] actual;
     delete[] expected;
     delete[] scores;

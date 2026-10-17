@@ -179,52 +179,82 @@ static void VecOddEvenSort(int* order, float* packed_scores, int n)
 // Bitonic Sort Network (RVV vectorized)
 static void VecBitonicSort(int* order, float* packed_scores, int n)
 {
-    int p = 1;
-    while (p < n) p <<= 1;
+    if (n <= 1)
+        return;
 
-    for (int k = 2; k <= p; k <<= 1)
+    // A bitonic sorting network requires a power-of-two length. Pad with
+    // negative infinity so every real score sorts ahead of every padding lane.
+    size_t p = 1;
+    while (p < static_cast<size_t>(n)) p <<= 1;
+
+    float* padded_scores = new float[p];
+    int* padded_order = new int[p];
+    for (size_t i = 0; i < p; ++i)
     {
-        for (int j = k >> 1; j > 0; j >>= 1)
+        if (i < static_cast<size_t>(n))
         {
-            for (int i = 0; i < p; i += 2 * j)
-            {
-                bool dir_desc = ((i & k) == 0);
-                size_t rem = static_cast<size_t>(j);
-                size_t off = 0;
+            padded_scores[i] = packed_scores[i];
+            padded_order[i] = order[i];
+        }
+        else
+        {
+            padded_scores[i] = -__builtin_inff();
+            padded_order[i] = -1;
+        }
+    }
 
+    for (size_t k = 2; k <= p; k <<= 1)
+    {
+        for (size_t j = k >> 1; j > 0; j >>= 1)
+        {
+            for (size_t i = 0; i < p; i += 2 * j)
+            {
+                const bool dir_desc = ((i & k) == 0);
+                size_t rem = j;
+                size_t off = 0;
                 while (rem > 0)
                 {
-                    size_t vl = rvv::SetVlF32M4(rem);
-                    size_t idx_a = static_cast<size_t>(i) + off;
-                    size_t idx_b = idx_a + static_cast<size_t>(j);
+                    const size_t vl = rvv::SetVlF32M4(rem);
+                    const size_t idx_a = i + off;
+                    const size_t idx_b = idx_a + j;
 
-                    if (idx_a < static_cast<size_t>(n) && idx_b < static_cast<size_t>(n))
-                    {
-                        rvv::F32M4 a_sc = rvv::LoadF32M4(packed_scores + idx_a, vl);
-                        rvv::F32M4 b_sc = rvv::LoadF32M4(packed_scores + idx_b, vl);
+                    rvv::F32M4 a_sc = rvv::LoadF32M4(padded_scores + idx_a, vl);
+                    rvv::F32M4 b_sc = rvv::LoadF32M4(padded_scores + idx_b, vl);
+                    rvv::I32M4 a_id = rvv::LoadI32M4(padded_order + idx_a, vl);
+                    rvv::I32M4 b_id = rvv::LoadI32M4(padded_order + idx_b, vl);
+                    const rvv::MaskF32M4 equal_score = rvv::MaskF32EqualM4(a_sc, b_sc, vl);
+                    const rvv::MaskF32M4 score_swap = dir_desc
+                        ? rvv::MaskF32LessThanM4(a_sc, b_sc, vl)
+                        : rvv::MaskF32LessThanM4(b_sc, a_sc, vl);
+                    const rvv::MaskF32M4 index_swap = dir_desc
+                        ? rvv::MaskI32LessThanM4(b_id, a_id, vl)
+                        : rvv::MaskI32LessThanM4(a_id, b_id, vl);
+                    const rvv::MaskF32M4 tie_swap = rvv::MaskAndM4(equal_score, index_swap, vl);
+                    const rvv::MaskF32M4 swap_m = rvv::MaskOrM4(score_swap, tie_swap, vl);
 
-                        rvv::MaskF32M4 swap_m = dir_desc
-                            ? rvv::MaskF32LessThanM4(a_sc, b_sc, vl)
-                            : rvv::MaskF32LessThanM4(b_sc, a_sc, vl);
+                    rvv::F32M4 new_a_sc = rvv::MergeF32M4(a_sc, b_sc, swap_m, vl);
+                    rvv::F32M4 new_b_sc = rvv::MergeF32M4(b_sc, a_sc, swap_m, vl);
+                    rvv::StoreF32M4(padded_scores + idx_a, new_a_sc, vl);
+                    rvv::StoreF32M4(padded_scores + idx_b, new_b_sc, vl);
+                    rvv::I32M4 new_a_id = rvv::MergeI32M4(a_id, b_id, swap_m, vl);
+                    rvv::I32M4 new_b_id = rvv::MergeI32M4(b_id, a_id, swap_m, vl);
+                    rvv::StoreI32M4(padded_order + idx_a, new_a_id, vl);
+                    rvv::StoreI32M4(padded_order + idx_b, new_b_id, vl);
 
-                        rvv::F32M4 new_a_sc = rvv::MergeF32M4(a_sc, b_sc, swap_m, vl);
-                        rvv::F32M4 new_b_sc = rvv::MergeF32M4(b_sc, a_sc, swap_m, vl);
-                        rvv::StoreF32M4(packed_scores + idx_a, new_a_sc, vl);
-                        rvv::StoreF32M4(packed_scores + idx_b, new_b_sc, vl);
-
-                        rvv::I32M4 a_id = rvv::LoadI32M4(order + idx_a, vl);
-                        rvv::I32M4 b_id = rvv::LoadI32M4(order + idx_b, vl);
-                        rvv::I32M4 new_a_id = rvv::MergeI32M4(a_id, b_id, swap_m, vl);
-                        rvv::I32M4 new_b_id = rvv::MergeI32M4(b_id, a_id, swap_m, vl);
-                        rvv::StoreI32M4(order + idx_a, new_a_id, vl);
-                        rvv::StoreI32M4(order + idx_b, new_b_id, vl);
-                    }
                     off += vl;
                     rem -= vl;
                 }
             }
         }
     }
+
+    for (int i = 0; i < n; ++i)
+    {
+        packed_scores[i] = padded_scores[i];
+        order[i] = padded_order[i];
+    }
+    delete[] padded_order;
+    delete[] padded_scores;
 }
 
 // ============================================================================
