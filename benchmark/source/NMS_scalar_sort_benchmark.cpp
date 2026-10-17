@@ -64,8 +64,14 @@ static void BenchmarkScalarBitonicSort(int* order, float* scores, int n)
 // Benchmark: Scalar Odd-Even Sort vs. Scalar Bitonic Sort
 int main()
 {
-    const int n_sort = 64;
+#ifdef RISCV_BAREMETAL
+    riscv_enable_vector();
+    const int sort_iters = 3;
+#else
     const int sort_iters = 50;
+#endif
+
+    const int n_sort = 64;
 
     printf("--- Benchmark: Scalar Odd-Even vs. Bitonic Sort (%d candidates, %d iterations) ---\n", n_sort, sort_iters);
 

@@ -132,10 +132,12 @@ int main()
 {
 #ifdef RISCV_BAREMETAL
     riscv_enable_vector();
+    const int sort_iters = 3;
+#else
+    const int sort_iters = 50;
 #endif
 
     const int n_sort = 64;
-    const int sort_iters = 50;
 
     printf("--- Benchmark: Vectorized Odd-Even vs. Bitonic Sort (RVV, %d candidates, %d iterations) ---\n", n_sort, sort_iters);
 

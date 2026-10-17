@@ -9,7 +9,11 @@ int main()
     riscv_enable_vector();
 #endif
 
+#ifdef RISCV_BAREMETAL
+    const int loop_count = 2;
+#else
     const int loop_count = 5;
+#endif
     const int n_heavy = 64;
 
     printf("--- Benchmark: Dense Overlapping NMS (%d boxes, %d iterations) ---\n", n_heavy, loop_count);

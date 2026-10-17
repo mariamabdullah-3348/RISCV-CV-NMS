@@ -10,7 +10,11 @@ int main()
 #endif
 
     const int box_count  = 80;
+#ifdef RISCV_BAREMETAL
+    const int loop_count = 2;
+#else
     const int loop_count = 5;
+#endif
 
     printf("--- Benchmark: Standard NMS (80 boxes, %d iterations) ---\n", loop_count);
 
