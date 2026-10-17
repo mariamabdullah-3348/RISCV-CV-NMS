@@ -176,6 +176,57 @@ static void VecOddEvenSort(int* order, float* packed_scores, int n)
     }
 }
 
+// Bitonic Sort Network (RVV vectorized)
+static void VecBitonicSort(int* order, float* packed_scores, int n)
+{
+    int p = 1;
+    while (p < n) p <<= 1;
+
+    for (int k = 2; k <= p; k <<= 1)
+    {
+        for (int j = k >> 1; j > 0; j >>= 1)
+        {
+            for (int i = 0; i < p; i += 2 * j)
+            {
+                bool dir_desc = ((i & k) == 0);
+                size_t rem = static_cast<size_t>(j);
+                size_t off = 0;
+
+                while (rem > 0)
+                {
+                    size_t vl = rvv::SetVlF32M4(rem);
+                    size_t idx_a = static_cast<size_t>(i) + off;
+                    size_t idx_b = idx_a + static_cast<size_t>(j);
+
+                    if (idx_a < static_cast<size_t>(n) && idx_b < static_cast<size_t>(n))
+                    {
+                        rvv::F32M4 a_sc = rvv::LoadF32M4(packed_scores + idx_a, vl);
+                        rvv::F32M4 b_sc = rvv::LoadF32M4(packed_scores + idx_b, vl);
+
+                        rvv::MaskF32M4 swap_m = dir_desc
+                            ? rvv::MaskF32LessThanM4(a_sc, b_sc, vl)
+                            : rvv::MaskF32LessThanM4(b_sc, a_sc, vl);
+
+                        rvv::F32M4 new_a_sc = rvv::MergeF32M4(a_sc, b_sc, swap_m, vl);
+                        rvv::F32M4 new_b_sc = rvv::MergeF32M4(b_sc, a_sc, swap_m, vl);
+                        rvv::StoreF32M4(packed_scores + idx_a, new_a_sc, vl);
+                        rvv::StoreF32M4(packed_scores + idx_b, new_b_sc, vl);
+
+                        rvv::I32M4 a_id = rvv::LoadI32M4(order + idx_a, vl);
+                        rvv::I32M4 b_id = rvv::LoadI32M4(order + idx_b, vl);
+                        rvv::I32M4 new_a_id = rvv::MergeI32M4(a_id, b_id, swap_m, vl);
+                        rvv::I32M4 new_b_id = rvv::MergeI32M4(b_id, a_id, swap_m, vl);
+                        rvv::StoreI32M4(order + idx_a, new_a_id, vl);
+                        rvv::StoreI32M4(order + idx_b, new_b_id, vl);
+                    }
+                    off += vl;
+                    rem -= vl;
+                }
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Stage 3 — SoA corner pack
 // ============================================================================
@@ -327,16 +378,20 @@ static void VecIouSuppressOne(const float* soa_y1,
 // ============================================================================
 // Public entry point
 // ============================================================================
-int vec::NonMaxSuppression(const float*    boxes,
-                           const float*    scores,
-                           int             num_batches,
-                           int             num_classes,
-                           int             spatial_dim,
-                           int64_t         max_output_boxes_per_class,
-                           float           iou_threshold,
-                           const float*    score_threshold,
-                           CenterPointBox  center_point_box,
-                           int64_t*        selected_indices)
+// ============================================================================
+// Internal pipeline runner
+// ============================================================================
+static int NonMaxSuppressionImpl(const float*    boxes,
+                                 const float*    scores,
+                                 int             num_batches,
+                                 int             num_classes,
+                                 int             spatial_dim,
+                                 int64_t         max_output_boxes_per_class,
+                                 float           iou_threshold,
+                                 const float*    score_threshold,
+                                 CenterPointBox  center_point_box,
+                                 int64_t*        selected_indices,
+                                 bool            use_bitonic_sort)
 {
     (void)center_point_box;  // always Corners; caller asserts
 
@@ -372,8 +427,6 @@ int vec::NonMaxSuppression(const float*    boxes,
 
             // ------------------------------------------------------------------
             // Stage 1 — Score filter
-            // Packs surviving box indices into order[] and their scores into
-            // packed_scores[], in original discovery order.
             // ------------------------------------------------------------------
             const int n = VecScoreFilter(class_scores, spatial_dim,
                                          thr, use_threshold,
@@ -382,22 +435,25 @@ int vec::NonMaxSuppression(const float*    boxes,
                 continue;
 
             // ------------------------------------------------------------------
-            // Stage 2 — Odd-even sort   (even phase first, then odd phase)
-            // Sorts packed_scores[] descending and reorders order[] to match.
+            // Stage 2 — Sorting: Odd-Even Sort or Bitonic Sort
             // ------------------------------------------------------------------
-            VecOddEvenSort(order, packed_scores, n);
+            if (use_bitonic_sort)
+            {
+                VecBitonicSort(order, packed_scores, n);
+            }
+            else
+            {
+                VecOddEvenSort(order, packed_scores, n);
+            }
 
             // ------------------------------------------------------------------
             // Stage 3 — SoA corner pack
-            // Packs box corners into four contiguous arrays aligned with order[].
             // ------------------------------------------------------------------
             VecSoAPack(batch_boxes, order, n,
                        soa_y1, soa_x1, soa_y2, soa_x2);
 
             // ------------------------------------------------------------------
             // Stage 4 — Greedy IoU suppress  (scan + IoU)
-            // Outer scalar loop keeps boxes; inner vector loop suppresses later
-            // slots whose IoU with the kept box exceeds iou_threshold.
             // ------------------------------------------------------------------
             for (int i = 0; i < n; ++i)
                 suppressed[i] = false;
@@ -434,4 +490,42 @@ int vec::NonMaxSuppression(const float*    boxes,
     delete[] packed_scores;
     delete[] order;
     return total_written;
+}
+
+// Public API: Odd-Even Sort (Standard / Illustration matching)
+int vec::NonMaxSuppression(const float*    boxes,
+                           const float*    scores,
+                           int             num_batches,
+                           int             num_classes,
+                           int             spatial_dim,
+                           int64_t         max_output_boxes_per_class,
+                           float           iou_threshold,
+                           const float*    score_threshold,
+                           CenterPointBox  center_point_box,
+                           int64_t*        selected_indices)
+{
+    return NonMaxSuppressionImpl(boxes, scores, num_batches, num_classes,
+                                 spatial_dim, max_output_boxes_per_class,
+                                 iou_threshold, score_threshold,
+                                 center_point_box, selected_indices,
+                                 /*use_bitonic_sort=*/false);
+}
+
+// Public API: Bitonic Sort Network
+int vec::NonMaxSuppressionBitonic(const float*    boxes,
+                                  const float*    scores,
+                                  int             num_batches,
+                                  int             num_classes,
+                                  int             spatial_dim,
+                                  int64_t         max_output_boxes_per_class,
+                                  float           iou_threshold,
+                                  const float*    score_threshold,
+                                  CenterPointBox  center_point_box,
+                                  int64_t*        selected_indices)
+{
+    return NonMaxSuppressionImpl(boxes, scores, num_batches, num_classes,
+                                 spatial_dim, max_output_boxes_per_class,
+                                 iou_threshold, score_threshold,
+                                 center_point_box, selected_indices,
+                                 /*use_bitonic_sort=*/true);
 }

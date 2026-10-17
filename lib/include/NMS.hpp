@@ -26,4 +26,16 @@ namespace vec
                           const float* score_threshold,
                           CenterPointBox center_point_box,
                           int64_t* selected_indices);
+
+    // Vectorized NonMaxSuppression using Bitonic Sort Network instead of Odd-Even Sort
+    int NonMaxSuppressionBitonic(const float* boxes,
+                                 const float* scores,
+                                 int num_batches,
+                                 int num_classes,
+                                 int spatial_dim,
+                                 int64_t max_output_boxes_per_class,
+                                 float iou_threshold,
+                                 const float* score_threshold,
+                                 CenterPointBox center_point_box,
+                                 int64_t* selected_indices);
 }

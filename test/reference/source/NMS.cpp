@@ -85,6 +85,127 @@ namespace
                 break;
         }
     }
+    // Bitonic sort (descending order)
+    void BitonicSort(int* indices, const float* scores, int n)
+    {
+        int p = 1;
+        while (p < n) p <<= 1;
+
+        for (int k = 2; k <= p; k <<= 1)
+        {
+            for (int j = k >> 1; j > 0; j >>= 1)
+            {
+                for (int i = 0; i < p; ++i)
+                {
+                    int l = i ^ j;
+                    if (l > i)
+                    {
+                        bool dir_descending = ((i & k) == 0);
+                        if (l < n)
+                        {
+                            bool should_swap = dir_descending ? (scores[indices[i]] < scores[indices[l]])
+                                                              : (scores[indices[i]] > scores[indices[l]]);
+                            if (should_swap)
+                            {
+                                const int tmp = indices[i];
+                                indices[i] = indices[l];
+                                indices[l] = tmp;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    int NonMaxSuppressionImpl(const float* boxes,
+                              const float* scores,
+                              int num_batches,
+                              int num_classes,
+                              int spatial_dim,
+                              int64_t max_output_boxes_per_class,
+                              float iou_threshold,
+                              const float* score_threshold,
+                              CenterPointBox center_point_box,
+                              int64_t* selected_indices,
+                              bool use_bitonic_sort)
+    {
+        (void)center_point_box;
+
+        if (num_batches <= 0 || num_classes <= 0 || spatial_dim <= 0 ||
+            max_output_boxes_per_class <= 0)
+        {
+            return 0;
+        }
+
+        int* idx = new int[static_cast<size_t>(spatial_dim)];
+        bool* suppressed = new bool[static_cast<size_t>(spatial_dim)];
+        int total_written = 0;
+
+        for (int b = 0; b < num_batches; ++b)
+        {
+            const float* batch_boxes = boxes + static_cast<ptrdiff_t>(b) * spatial_dim * 4;
+
+            for (int c = 0; c < num_classes; ++c)
+            {
+                const float* class_scores =
+                    scores + (static_cast<ptrdiff_t>(b) * num_classes + c) * spatial_dim;
+
+                int n = 0;
+                for (int i = 0; i < spatial_dim; ++i)
+                {
+                    if (score_threshold == nullptr || class_scores[i] >= *score_threshold)
+                    {
+                        idx[n++] = i;
+                    }
+                }
+
+                if (n == 0)
+                    continue;
+
+                if (use_bitonic_sort)
+                {
+                    BitonicSort(idx, class_scores, n);
+                }
+                else
+                {
+                    OddEvenSort(idx, class_scores, n);
+                }
+
+                for (int i = 0; i < n; ++i)
+                    suppressed[i] = false;
+
+                int kept = 0;
+                for (int i = 0; i < n && kept < max_output_boxes_per_class; ++i)
+                {
+                    if (suppressed[i])
+                        continue;
+
+                    selected_indices[(total_written + kept) * 3 + 0] = static_cast<int64_t>(b);
+                    selected_indices[(total_written + kept) * 3 + 1] = static_cast<int64_t>(c);
+                    selected_indices[(total_written + kept) * 3 + 2] = static_cast<int64_t>(idx[i]);
+                    ++kept;
+
+                    const float* box_i = batch_boxes + idx[i] * 4;
+
+                    for (int j = i + 1; j < n; ++j)
+                    {
+                        if (suppressed[j])
+                            continue;
+                        const float* box_j = batch_boxes + idx[j] * 4;
+                        if (IoU(box_i, box_j) > iou_threshold)
+                            suppressed[j] = true;
+                    }
+                }
+
+                total_written += kept;
+            }
+        }
+
+        delete[] suppressed;
+        delete[] idx;
+        return total_written;
+    }
 } // namespace
 
 int ref::NonMaxSuppression(const float* boxes,
@@ -98,96 +219,27 @@ int ref::NonMaxSuppression(const float* boxes,
                            CenterPointBox center_point_box,
                            int64_t* selected_indices)
 {
-    (void)center_point_box; // always Corners; caller asserts
+    return NonMaxSuppressionImpl(boxes, scores, num_batches, num_classes,
+                                 spatial_dim, max_output_boxes_per_class,
+                                 iou_threshold, score_threshold,
+                                 center_point_box, selected_indices,
+                                 /*use_bitonic_sort=*/false);
+}
 
-    // Early-exit on degenerate inputs (matches ONNX spec).
-    if (num_batches <= 0 || num_classes <= 0 || spatial_dim <= 0 ||
-        max_output_boxes_per_class <= 0)
-    {
-        return 0;
-    }
-
-    // Working index buffer; reused for every (batch, class) pair.
-    int* idx = new int[static_cast<size_t>(spatial_dim)];
-
-    // Suppression bitmap: suppressed[i] == true means box i is suppressed.
-    bool* suppressed = new bool[static_cast<size_t>(spatial_dim)];
-
-    int total_written = 0;
-
-    for (int b = 0; b < num_batches; ++b)
-    {
-        // boxes layout: [num_batches, spatial_dim, 4]
-        const float* batch_boxes = boxes + static_cast<ptrdiff_t>(b) * spatial_dim * 4;
-
-        for (int c = 0; c < num_classes; ++c)
-        {
-            // scores layout: [num_batches, num_classes, spatial_dim]
-            const float* class_scores =
-                scores +
-                (static_cast<ptrdiff_t>(b) * num_classes + c) * spatial_dim;
-
-            // ----------------------------------------------------------------
-            // Step 1: Score suppression — collect indices above threshold.
-            // ----------------------------------------------------------------
-            int n = 0; // number of candidates after score filter
-            for (int i = 0; i < spatial_dim; ++i)
-            {
-                if (score_threshold == nullptr ||
-                    class_scores[i] >= *score_threshold)
-                {
-                    idx[n++] = i;
-                }
-            }
-
-            if (n == 0)
-                continue;
-
-            // ----------------------------------------------------------------
-            // Step 2: Sort candidates by score, highest first (stable).
-            //         We use odd-even sort so the vector version mirrors this.
-            // ----------------------------------------------------------------
-            OddEvenSort(idx, class_scores, n);
-
-            // ----------------------------------------------------------------
-            // Step 3: Greedy IoU suppression.
-            // ----------------------------------------------------------------
-            for (int i = 0; i < n; ++i)
-                suppressed[i] = false;
-
-            int kept = 0;
-            for (int i = 0; i < n && kept < max_output_boxes_per_class; ++i)
-            {
-                if (suppressed[i])
-                    continue;
-
-                // Keep this box.
-                selected_indices[(total_written + kept) * 3 + 0] =
-                    static_cast<int64_t>(b);
-                selected_indices[(total_written + kept) * 3 + 1] =
-                    static_cast<int64_t>(c);
-                selected_indices[(total_written + kept) * 3 + 2] =
-                    static_cast<int64_t>(idx[i]);
-                ++kept;
-
-                const float* box_i = batch_boxes + idx[i] * 4;
-
-                // Suppress later boxes that overlap this one too much.
-                for (int j = i + 1; j < n; ++j)
-                {
-                    if (suppressed[j])
-                        continue;
-                    const float* box_j = batch_boxes + idx[j] * 4;
-                    if (IoU(box_i, box_j) > iou_threshold)
-                        suppressed[j] = true;
-                }
-            }
-
-            total_written += kept;
-        }
-    }
-
-    delete[] suppressed;
-    delete[] idx;
-    return total_written;
+int ref::NonMaxSuppressionBitonic(const float* boxes,
+                                  const float* scores,
+                                  int num_batches,
+                                  int num_classes,
+                                  int spatial_dim,
+                                  int64_t max_output_boxes_per_class,
+                                  float iou_threshold,
+                                  const float* score_threshold,
+                                  CenterPointBox center_point_box,
+                                  int64_t* selected_indices)
+{
+    return NonMaxSuppressionImpl(boxes, scores, num_batches, num_classes,
+                                 spatial_dim, max_output_boxes_per_class,
+                                 iou_threshold, score_threshold,
+                                 center_point_box, selected_indices,
+                                 /*use_bitonic_sort=*/true);
 }
