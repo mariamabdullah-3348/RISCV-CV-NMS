@@ -34,31 +34,30 @@ static void BenchmarkScalarBitonicSort(int* order, float* scores, int n)
 {
     int p = 1;
     while (p < n) p <<= 1;
-
-    for (int k = 2; k <= p; k <<= 1)
+    float* ps = new float[static_cast<size_t>(p)];
+    int* pi = new int[static_cast<size_t>(p)];
+    for (int i = 0; i < p; ++i)
     {
+        ps[i] = i < n ? scores[i] : -__builtin_inff();
+        pi[i] = i < n ? order[i] : -1;
+    }
+    for (int k = 2; k <= p; k <<= 1)
         for (int j = k >> 1; j > 0; j >>= 1)
-        {
             for (int i = 0; i < p; ++i)
             {
                 int l = i ^ j;
-                if (l > i)
+                if (l <= i) continue;
+                bool desc = ((i & k) == 0);
+                bool swap = desc ? (ps[i] < ps[l]) : (ps[i] > ps[l]);
+                if (swap)
                 {
-                    bool dir_descending = ((i & k) == 0);
-                    if (l < n)
-                    {
-                        bool should_swap = dir_descending ? (scores[i] < scores[l])
-                                                          : (scores[i] > scores[l]);
-                        if (should_swap)
-                        {
-                            float fs = scores[i]; scores[i] = scores[l]; scores[l] = fs;
-                            int   is = order[i];  order[i]  = order[l];  order[l]  = is;
-                        }
-                    }
+                    float fs = ps[i]; ps[i] = ps[l]; ps[l] = fs;
+                    int ix = pi[i]; pi[i] = pi[l]; pi[l] = ix;
                 }
             }
-        }
-    }
+    for (int i = 0; i < n; ++i) { scores[i] = ps[i]; order[i] = pi[i]; }
+    delete[] pi;
+    delete[] ps;
 }
 
 // Benchmark: Scalar Odd-Even Sort vs. Scalar Bitonic Sort
@@ -120,12 +119,16 @@ int main()
               odd_even_instrs / static_cast<uint64_t>(sort_iters),
               bitonic_instrs  / static_cast<uint64_t>(sort_iters));
 
+    const bool sort_ok = ValidateSortedScores(ord_oe, sc_oe, sc_orig, n_sort) &&
+                         ValidateSortedScores(ord_bi, sc_bi, sc_orig, n_sort);
+
     delete[] ord_bi;
     delete[] ord_oe;
     delete[] sc_bi;
     delete[] sc_oe;
     delete[] sc_orig;
 
+    if (!sort_ok) { printf("Output is wrong!\n"); return 1; }
     printf("Output is correct.\n");
     return 0;
 }

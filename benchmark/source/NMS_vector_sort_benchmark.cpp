@@ -81,50 +81,39 @@ static void BenchmarkVectorBitonicSort(int* order, float* scores, int n)
 {
     int p = 1;
     while (p < n) p <<= 1;
-
-    for (int k = 2; k <= p; k <<= 1)
+    float* ps = new float[static_cast<size_t>(p)];
+    int* pi = new int[static_cast<size_t>(p)];
+    for (int i = 0; i < p; ++i)
     {
-        for (int j = k >> 1; j > 0; j >>= 1)
-        {
-            for (int i = 0; i < p; i += 2 * j)
+        ps[i] = i < n ? scores[i] : -__builtin_inff();
+        pi[i] = i < n ? order[i] : -1;
+    }
+    for (size_t k = 2; k <= static_cast<size_t>(p); k <<= 1)
+        for (size_t j = k >> 1; j > 0; j >>= 1)
+            for (size_t i = 0; i < static_cast<size_t>(p); i += 2 * j)
             {
-                bool dir_desc = ((i & k) == 0);
-                size_t rem = static_cast<size_t>(j);
-                size_t off = 0;
-
+                const bool desc = ((i & k) == 0);
+                size_t rem = j, off = 0;
                 while (rem > 0)
                 {
                     size_t vl = rvv::SetVlF32M4(rem);
-                    size_t idx_a = static_cast<size_t>(i) + off;
-                    size_t idx_b = idx_a + static_cast<size_t>(j);
-
-                    if (idx_a < static_cast<size_t>(n) && idx_b < static_cast<size_t>(n))
-                    {
-                        rvv::F32M4 a_sc = rvv::LoadF32M4(scores + idx_a, vl);
-                        rvv::F32M4 b_sc = rvv::LoadF32M4(scores + idx_b, vl);
-
-                        rvv::MaskF32M4 swap_m = dir_desc
-                            ? rvv::MaskF32LessThanM4(a_sc, b_sc, vl)
-                            : rvv::MaskF32LessThanM4(b_sc, a_sc, vl);
-
-                        rvv::F32M4 new_a_sc = rvv::MergeF32M4(a_sc, b_sc, swap_m, vl);
-                        rvv::F32M4 new_b_sc = rvv::MergeF32M4(b_sc, a_sc, swap_m, vl);
-                        rvv::StoreF32M4(scores + idx_a, new_a_sc, vl);
-                        rvv::StoreF32M4(scores + idx_b, new_b_sc, vl);
-
-                        rvv::I32M4 a_id = rvv::LoadI32M4(order + idx_a, vl);
-                        rvv::I32M4 b_id = rvv::LoadI32M4(order + idx_b, vl);
-                        rvv::I32M4 new_a_id = rvv::MergeI32M4(a_id, b_id, swap_m, vl);
-                        rvv::I32M4 new_b_id = rvv::MergeI32M4(b_id, a_id, swap_m, vl);
-                        rvv::StoreI32M4(order + idx_a, new_a_id, vl);
-                        rvv::StoreI32M4(order + idx_b, new_b_id, vl);
-                    }
-                    off += vl;
-                    rem -= vl;
+                    size_t a = i + off, b = a + j;
+                    rvv::F32M4 as = rvv::LoadF32M4(ps + a, vl);
+                    rvv::F32M4 bs = rvv::LoadF32M4(ps + b, vl);
+                    rvv::MaskF32M4 m = desc ? rvv::MaskF32LessThanM4(as, bs, vl)
+                                            : rvv::MaskF32LessThanM4(bs, as, vl);
+                    rvv::StoreF32M4(ps + a, rvv::MergeF32M4(as, bs, m, vl), vl);
+                    rvv::StoreF32M4(ps + b, rvv::MergeF32M4(bs, as, m, vl), vl);
+                    rvv::I32M4 ai = rvv::LoadI32M4(pi + a, vl);
+                    rvv::I32M4 bi = rvv::LoadI32M4(pi + b, vl);
+                    rvv::StoreI32M4(pi + a, rvv::MergeI32M4(ai, bi, m, vl), vl);
+                    rvv::StoreI32M4(pi + b, rvv::MergeI32M4(bi, ai, m, vl), vl);
+                    off += vl; rem -= vl;
                 }
             }
-        }
-    }
+    for (int i = 0; i < n; ++i) { scores[i] = ps[i]; order[i] = pi[i]; }
+    delete[] pi;
+    delete[] ps;
 }
 
 // Benchmark: Vector Odd-Even Sort vs. Vector Bitonic Sort (RVV)
@@ -186,12 +175,16 @@ int main()
               vec_oe_instrs / static_cast<uint64_t>(sort_iters),
               vec_bi_instrs / static_cast<uint64_t>(sort_iters));
 
+    const bool sort_ok = ValidateSortedScores(ord_oe, sc_oe, sc_orig, n_sort) &&
+                         ValidateSortedScores(ord_bi, sc_bi, sc_orig, n_sort);
+
     delete[] ord_bi;
     delete[] ord_oe;
     delete[] sc_bi;
     delete[] sc_oe;
     delete[] sc_orig;
 
+    if (!sort_ok) { printf("Output is wrong!\n"); return 1; }
     printf("Output is correct.\n");
     return 0;
 }

@@ -27,3 +27,21 @@ inline void PrintTime(const char* name, uint64_t scalar_cycles,
                (unsigned long long)(speedup_x100 % 100));
     }
 }
+
+
+// Validate descending order and score/index association for standalone sort
+// benchmarks. original_scores[id] is the score belonging to original index id.
+inline bool ValidateSortedScores(const int* order, const float* sorted_scores,
+                                 const float* original_scores, int n)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        if (order[i] < 0 || order[i] >= n)
+            return false;
+        if (sorted_scores[i] != original_scores[order[i]])
+            return false;
+        if (i > 0 && sorted_scores[i - 1] < sorted_scores[i])
+            return false;
+    }
+    return true;
+}
