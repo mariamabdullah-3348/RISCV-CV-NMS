@@ -145,19 +145,24 @@ This reduces the IoU inner loop from `O(n)` scalar iterations to `O(n/VLMAX)` ve
 ```
 NMS benchmark: 80 boxes, 5 iterations
 NMS odd-even-sort (scalar vs vectorized):
-  reference  : 918,158 cycles, 917,716 instructions
-  vectorized : 4,465,724 cycles, 4,466,161 instructions
-  speedup    : 0.20x
+  reference  : 900,358 cycles, 899,659 instructions
+  vectorized : 4,766,083 cycles, 4,766,497 instructions
+  speedup    : 0.18x
 
 NMS heavy (overlapping 64 boxes, scalar vs vectorized):
-  reference  : 552,846 cycles, 547,821 instructions
-  vectorized : 3,242,994 cycles, 3,244,107 instructions
-  speedup    : 0.17x
+  reference  : 584,427 cycles, 581,282 instructions
+  vectorized : 3,189,301 cycles, 3,189,449 instructions
+  speedup    : 0.18x
 
-Sort comparison: Odd-Even vs. Bitonic (64 candidates):
-  reference (Odd-Even) : 230,531 cycles, 230,502 instructions
-  vectorized (Bitonic) : 28,551 cycles, 28,656 instructions
-  speedup              : 8.07x
+Scalar Sort: Odd-Even vs. Bitonic (64 candidates):
+  reference (Odd-Even) : 223,532 cycles, 223,426 instructions
+  vectorized (Bitonic) :  29,842 cycles,  29,902 instructions
+  speedup              :  7.49x
+
+Vector Sort (RVV): Odd-Even vs. Bitonic (64 candidates):
+  reference (Odd-Even) : 518,482 cycles, 518,192 instructions
+  vectorized (Bitonic) : 257,909 cycles, 258,041 instructions
+  speedup              :  2.01x
 Output is correct.
 ```
 
