@@ -1,237 +1,137 @@
-# RISC-V CV – NonMaxSuppression (NMS) Lab
+# RISC-V CV — Non-Maximum Suppression (NMS)
 
-> **Student:** mariamabdullah-3348  
-> **Base repo:** [youssefmfathy88/RISCV-CV-NMS](https://github.com/youssefmfathy88/RISCV-CV-NMS)
+This project implements ONNX-style **Non-Maximum Suppression (NMS)** in scalar C++ and RISC-V Vector (RVV) code, and benchmarks two sorting strategies: odd-even transposition sort and bitonic sort.
 
-Implements ONNX-style NonMaxSuppression (NMS) on RISC-V, in both scalar and RVV-vectorized form, and compares odd-even vs. bitonic sorting performance.
+The assignment-focused performance experiment runs four configurations as **four separate gem5 simulations**:
 
----
+1. Scalar + odd-even sort
+2. Scalar + bitonic sort
+3. RVV + odd-even sort
+4. RVV + bitonic sort
 
-## Repository Structure
+Each benchmark checks its selected indices against the scalar odd-even reference before timing the case. The benchmark prints `Output is correct.` only if all configured test sizes pass. This README describes how to build and run the experiment; performance results should be regenerated on the machine/configuration being evaluated rather than treated as universal numbers.
 
-```
-test/reference/source/NMS.cpp   ← scalar C++ implementation (ref::)
-lib/source/NMS.cpp              ← vectorized RVV implementation (vec::)
-benchmark/source/NMS_benchmark.cpp ← performance comparison benchmark
-```
+## NMS behavior
 
----
+For each batch and class, the implementation:
 
-## Algorithm
+1. Filters out boxes whose score is **strictly less than** `score_threshold` (a score equal to the threshold is retained).
+2. Sorts the surviving candidates by descending score.
+3. Greedily keeps a candidate and suppresses later candidates only when their IoU is **strictly greater than** `iou_threshold`.
+4. Stops after `max_output_boxes_per_class` selections.
 
-For each **(batch, class)** pair:
+Input boxes use corner coordinates `[y1, x1, y2, x2]`; scores are arranged by batch, class, and candidate. Output rows contain `[batch_index, class_index, box_index]`. The current implementation path uses corner-format boxes (`CenterPointBox::Corners`).
 
-| Step | Description |
-|------|-------------|
-| 1. Score suppression | Drop boxes whose score is **strictly below** `score_threshold` (if set). |
-| 2. Sorting | Order remaining boxes by score, **highest first** (stable: equal scores keep original box order). |
-| 3. IoU suppression | Greedily keep a box; suppress later boxes whose IoU is **strictly greater** than `iou_threshold`, until `max_output_boxes_per_class` boxes are kept. |
+## Implementation overview
 
-Boxes: `float32 [num_batches, spatial_dim, 4]` in corner format `[y1, x1, y2, x2]`.  
-Scores: `float32 [num_batches, num_classes, spatial_dim]`.  
-Output: `int64 [*, 3]` rows of `[batch, class, box_index]`.
-
----
-
-## Task 2 – Scalar Implementation (`ref::NonMaxSuppression`)
-
-**File:** [`test/reference/source/NMS.cpp`](test/reference/source/NMS.cpp)
-
-The scalar version implements all three NMS steps using plain C++:
-
-### 2a. Score Suppression
-```cpp
-for (int i = 0; i < spatial_dim; ++i)
-    if (score_threshold == nullptr || class_scores[i] >= *score_threshold)
-        idx[n++] = i;
-```
-
-### 2b. Sorting – Odd-Even Sort
-We chose **odd-even transposition sort** (also called bubble sort with alternating phases) because:
-1. Its pass structure (odd phase / even phase) maps directly to the vectorized implementation.
-2. It is stable: equal scores never swap, preserving original box order.
-
-```
-Pass 1: odd  phase → compare pairs (i=1,2), (i=3,4), ...
-        even phase → compare pairs (i=0,1), (i=2,3), ...
-Pass 2: repeat; break early if no swap.
-Direct descending order (sc[i] < sc[i+1] triggers swap), preserving tie stability.
-```
-
-### 2c. IoU Suppression
-Standard greedy suppression: keep box `i`, compute IoU against all remaining boxes `j > i`, mark as suppressed those with `IoU(i, j) > iou_threshold`.
-
-```cpp
-float IoU(const float* a, const float* b) {
-    // intersection / union, corner-format boxes
-}
-```
-
-### Test Against Golden Reference
-```bash
-# On RISC-V target (qemu or gem5):
-./unit_tests_qemu   # or gem5 equivalent
-# Runs NMSTest::ReferenceMatchesOnnxGolden
-```
-
-All 8 ONNX test cases pass: `suppress_by_IOU`, `suppress_by_IOU_and_scores`, `limit_output_size`, `single_box`, `identical_boxes`, `two_classes`, `two_batches`, `iou_threshold_boundary`.
-
----
-
-## Task 3 – Vectorized Implementation (`vec::NonMaxSuppression`)
-
-**File:** [`lib/source/NMS.cpp`](lib/source/NMS.cpp)  
-Uses only `rvv::` wrappers from [`lib/include/riscv_wrappers.hpp`](lib/include/riscv_wrappers.hpp).
-
-### 3a. Score Suppression (Vectorized)
-
-```
-rvv::LoadF32M4       → load VLMAX scores
-rvv::MaskF32GreaterEqualScalarM4 → mask = score >= threshold
-rvv::IotaU32M4 + rvv::AddU32M4  → absolute index vector
-rvv::CompressU32M4   → pack valid indices to front
-rvv::CompressF32M4   → pack valid scores to front
-rvv::CountTrueF32M4  → how many kept
-```
-
-Without a threshold, we skip the compare and use a pure iota-based fill.
-
-### 3b. Sorting – Odd-Even Sort (Vectorized)
-
-Follows the [riscv-illustration walkthrough](https://riscv-illustration.vercel.app/nms/walkthrough):
-- **Even phase first:** compare pairs `(0,1), (2,3), (4,5)...`
-- **Odd phase second:** compare pairs `(1,2), (3,4), (5,6)...`
-- **Swap condition:** `left_score < right_score` (enforces descending order while strictly preserving tie scores).
-- **Early termination:** exits if no swaps occur across a full iteration.
-
-### 3c. Structure-of-Arrays (SoA) Corner Packing
-
-Packs surviving box corners into four separate contiguous buffers aligned with `order[]`:
-- `soa_y1[]`, `soa_x1[]`, `soa_y2[]`, `soa_x2[]`
-
-This eliminates strided memory gathers during the IoU step and enables high-throughput vector loads (`rvv::LoadF32M2`).
-
-### 3d. IoU Suppression (Vectorized)
-
-For each kept box `i`, compute IoU against *all* remaining candidates `j > i` in vector lanes:
-
-```
-rvv::MaxF32ScalarM2 / MinF32ScalarM2 → clamp intersection corners
-rvv::SubF32M2, MulF32M2              → intersection area
-rvv::DivF32M2                        → IoU = inter / union
-rvv::MaskF32GreaterThanScalarM2      → suppress mask
-rvv::StoreU8Mf2Masked                → write suppression flags
-```
-
-This reduces the IoU inner loop from `O(n)` scalar iterations to `O(n/VLMAX)` vector iterations.
-
----
-
-## Task 4 – Sorting Performance Comparison
-
-### Odd-Even Sort vs. Bitonic Sort
-
-| Property | Odd-Even Transposition Sort | Bitonic Sorting Network |
+| Component | Location | Purpose |
 |---|---|---|
-| **Comparators** | O(n²) | O(n log²n) |
-| **Passes** | Up to n passes, early exit | Fixed log²n rounds |
-| **Stable** | Yes (natural stability) | No (unstable by default) |
-| **Parallelism** | Each phase fully data-parallel | Each round fully data-parallel |
-| **Memory Locality** | Sequential & contiguous | Strided / power-of-2 shuffles |
-| **Best For** | Small n (< 100), nearly-sorted inputs | Large n (n ≥ 64), power-of-2 batches |
+| Scalar reference | `test/reference/source/NMS.cpp` | Plain C++ NMS reference, including odd-even and bitonic entry points |
+| RVV implementation | `lib/source/NMS.cpp` | Vectorized score filtering, sorting, and IoU suppression using project RVV wrappers |
+| RVV wrappers | `lib/include/riscv_wrappers.hpp` | Wrapper layer for RVV operations |
+| Unit tests | `test/unit_test/source/NMS_test.cpp` | Functional tests against the project's golden fixtures |
+| Four-way benchmark sources | `benchmark/source/NMS_scalar_odd_even.cpp`, `NMS_scalar_bitonic.cpp`, `NMS_rvv_odd_even.cpp`, `NMS_rvv_bitonic.cpp` | One benchmark executable per configuration |
+| Benchmark build rules | `benchmark/CMakeLists.txt` | Creates gem5 targets, and optional QEMU targets |
+| gem5 assignment notes | `GEM5_ASSIGNMENT.md` | Four-run workflow and comparison guidance |
+| Stats summarizer | `tools/summarize_gem5_stats.py` | Collects key statistics from the four gem5 `stats.txt` files |
 
-**Measured Benchmark Results** (executed on RISC-V target via `cmake --build build --target run_NMS_benchmark_qemu`):
+## Requirements
 
-```
-NMS benchmark: 80 boxes, 5 iterations
-NMS odd-even-sort (scalar vs vectorized):
-  reference  : 900,358 cycles, 899,659 instructions
-  vectorized : 4,766,083 cycles, 4,766,497 instructions
-  speedup    : 0.18x
+The build expects:
 
-NMS heavy (overlapping 64 boxes, scalar vs vectorized):
-  reference  : 584,427 cycles, 581,282 instructions
-  vectorized : 3,189,301 cycles, 3,189,449 instructions
-  speedup    : 0.18x
+- A RISC-V cross-compilation toolchain supported by this project.
+- A built `nexus-am` checkout.
+- A built XiangShan gem5 checkout containing `build/RISCV/gem5.opt` and `configs/example/kmhv3.py`.
+- CMake and a host C/C++ build environment.
 
-Scalar Sort: Odd-Even vs. Bitonic (64 candidates):
-  reference (Odd-Even) : 223,532 cycles, 223,426 instructions
-  vectorized (Bitonic) :  29,842 cycles,  29,902 instructions
-  speedup              :  7.49x
+See [`SETUP.md`](SETUP.md) for environment setup. The paths can be supplied through `AM_HOME` and `XIANG_GEM5`, or directly through CMake options.
 
-Vector Sort (RVV): Odd-Even vs. Bitonic (64 candidates):
-  reference (Odd-Even) : 518,482 cycles, 518,192 instructions
-  vectorized (Bitonic) : 257,909 cycles, 258,041 instructions
-  speedup              :  2.01x
-Output is correct.
-```
+## Configure and build (gem5)
 
-> Standalone sorting algorithms and full NMS benchmarks are located in [`benchmark/source/NMS_benchmark.cpp`](benchmark/source/NMS_benchmark.cpp).
-
----
-
-## Build & Test
-
-### Prerequisites
-
-Follow [SETUP.md](SETUP.md) to install the RISC-V cross-compiler, nexus-am, and gem5.
-
-### Quick build for qemu (functional verification)
+Run these commands from the repository root. Adjust the two paths if your checkouts live elsewhere:
 
 ```bash
+export AM_HOME="$HOME/nexus-am"
+export XIANG_GEM5="$HOME/GEM5"
+
 cmake -S . -B build \
-      -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64_xs_toolchain.cmake
-
-cmake --build build --target NMS_test_qemu
-cmake --build build --target run_NMS_test_qemu
-
-# Or run all unit tests:
-cmake --build build --target run_unit_tests_qemu
+  -DCMAKE_TOOLCHAIN_FILE=cmake/riscv64_xs_toolchain.cmake \
+  -DNEXUS_AM_HOME="$AM_HOME" \
+  -DGEM5_HOME="$XIANG_GEM5" \
+  -DBUILD_QEMU_TARGETS=OFF \
+  -DCMAKE_BUILD_TYPE=Release
 ```
 
-### Running Individual Benchmarks (Separate QEMU & GEM5 Stats)
-
-To inspect performance counters, cycles, instructions, and gem5 `stats.txt` independently for each experiment, each test has its own target:
-
-| Experiment | QEMU Run Target | GEM5 Run Target (Writes `stats.txt`) |
-|---|---|---|
-| **1. Standard NMS (Scalar vs. Vector)** | `run_NMS_scalar_vs_vector_benchmark_qemu` | `run_NMS_scalar_vs_vector_benchmark_gem5` |
-| **2. Dense NMS (64 Overlapping Boxes)** | `run_NMS_heavy_benchmark_qemu` | `run_NMS_heavy_benchmark_gem5` |
-| **3. Scalar Sort (Odd-Even vs. Bitonic)** | `run_NMS_scalar_sort_benchmark_qemu` | `run_NMS_scalar_sort_benchmark_gem5` |
-| **4. Vector Sort (Odd-Even vs. Bitonic)** | `run_NMS_vector_sort_benchmark_qemu` | `run_NMS_vector_sort_benchmark_gem5` |
-| **All Experiments Combined** | `run_NMS_benchmark_qemu` | `run_NMS_benchmark_gem5` |
+Build the four executables:
 
 ```bash
-# Run any individual experiment on QEMU:
-cmake --build build --target run_NMS_scalar_vs_vector_benchmark_qemu
-cmake --build build --target run_NMS_scalar_sort_benchmark_qemu
-cmake --build build --target run_NMS_vector_sort_benchmark_qemu
-cmake --build build --target run_NMS_heavy_benchmark_qemu
-
-# Run any individual experiment on GEM5 to generate its isolated stats.txt:
-cmake --build build --target run_NMS_scalar_sort_benchmark_gem5
-# Dedicated stats output location:
-# build/benchmark/NMS_scalar_sort_benchmark_gem5-m5out/stats.txt
+cmake --build build --target \
+  NMS_scalar_odd_even_gem5 \
+  NMS_scalar_bitonic_gem5 \
+  NMS_rvv_odd_even_gem5 \
+  NMS_rvv_bitonic_gem5 \
+  -j"$(nproc)"
 ```
 
-### Golden Reference (Python)
+QEMU targets are optional and are disabled in this gem5-focused workflow. To enable them, configure with `-DBUILD_QEMU_TARGETS=ON` and ensure `qemu-riscv64` is installed.
+
+## Run each benchmark in its own gem5 process
+
+Run each target separately; do not combine the four algorithms into one timed process:
 
 ```bash
-cd test/GoldenReference
-pip install -r requirements.txt
-python test_nms_golden.py        # verify Python ONNX reference
-python generate_cpp_fixtures.py  # regenerate nms_onnx_cases.hpp if cases change
+cmake --build build --target run_NMS_scalar_odd_even_gem5
+cmake --build build --target run_NMS_scalar_bitonic_gem5
+cmake --build build --target run_NMS_rvv_odd_even_gem5
+cmake --build build --target run_NMS_rvv_bitonic_gem5
 ```
 
----
+Each run should create its own log and gem5 output directory under `build/benchmark/`. For example:
 
-## Definition of Done (DOD)
+```text
+build/benchmark/NMS_scalar_odd_even_gem5.log
+build/benchmark/NMS_scalar_odd_even_gem5-m5out/stats.txt
+```
 
-- [x] Repo installed & built from golden reference
-- [x] Scalar NMS (`ref::`) implemented & passes all 8 ONNX test cases
-- [x] Vectorized NMS (`vec::`) implemented using `rvv::` wrappers
-  - [x] Score suppression vectorized
-  - [x] Odd-even sort vectorized  
-  - [x] IoU suppression vectorized
-- [x] Performance benchmark comparing odd-even sort vs. bitonic sort
-- [x] Submitted to GitHub (`mariamabdullah-3348/RISCV-CV-NMS`)
+The precise paths depend on the configured build directory and CMake run rules. Check each log for `Output is correct.` and make sure it does not contain `Output is wrong!`. If a run fails, investigate it before comparing performance.
+
+The four-way benchmarks test candidate counts **17, 63, 64, 65, and 80**, with five timed iterations per size. The benchmark reports average kernel cycles and instructions for each size. These in-program measurements are more directly useful for comparing the algorithm implementations than whole-process gem5 statistics alone.
+
+## Summarize gem5 statistics
+
+After all four runs complete, execute:
+
+```bash
+python3 tools/summarize_gem5_stats.py
+```
+
+The script looks for the four expected `stats.txt` paths beneath `build/benchmark/` and generates:
+
+- `gem5_summary.csv` — selected gem5 metrics for each run.
+- `gem5_comparison.csv` — cycle-count ratios derived from `system.cpu.numCycles`.
+- `gem5_summary.txt` beside each run's `stats.txt`.
+
+These are generated, machine-specific artifacts and are ignored by Git by default. You can regenerate them after rerunning gem5. If a stats file is missing, the script reports that run as missing; run all four benchmarks before drawing conclusions.
+
+### How to interpret the results
+
+- Compare kernel `average_cycles` and `average_instructions` at the **same candidate count**.
+- Compare scalar vs. RVV while holding the sorting algorithm constant.
+- Compare odd-even vs. bitonic while holding scalar/RVV implementation constant.
+- `simTicks`, `simSeconds`, `simInsts`, `numCycles`, IPC, and CPI describe the complete simulated program, including setup and correctness checks. Do not assume whole-program `simTicks` equals time spent inside the timed NMS kernel.
+- Treat results as comparable only when workload, gem5 configuration, compiler settings, and build mode are the same.
+
+## Tests and golden fixtures
+
+The project includes unit tests and Python golden-reference utilities. See [`test/GoldenReference/README.md`](test/GoldenReference/README.md) for the fixture-generation workflow and requirements. Configure and build the test targets supported by your toolchain, then run the relevant test targets before accepting implementation changes.
+
+## Build output and Git
+
+The `build/` directory contains generated CMake files, object files, executables, logs, and gem5 output. **Do not commit it.** It is reproducible from the source and build instructions above, can be large, and often contains absolute paths specific to one machine. The repository `.gitignore` excludes it and the generated gem5 summary CSV/text files.
+
+## Repository files
+
+- [`GEM5_ASSIGNMENT.md`](GEM5_ASSIGNMENT.md) — assignment-specific run and comparison checklist.
+- [`SETUP.md`](SETUP.md) — dependency and environment setup.
+- [`IMAGEIO.md`](IMAGEIO.md) — image input/output utilities.
+- [`illustration/README.md`](illustration/README.md) — interactive NMS illustration.

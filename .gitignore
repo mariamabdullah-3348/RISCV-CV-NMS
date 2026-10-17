@@ -1,5 +1,22 @@
-build/*
+# CMake/build outputs and gem5 simulation artifacts
+/build/
+**/CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.o
+*.a
+*.elf
 *.pyc
+__pycache__/
+
+# Generated benchmark summaries (machine-specific)
+gem5_summary.csv
+gem5_comparison.csv
+**/gem5_summary.txt
+**/stats.txt
+
+# Illustration web app outputs
 illustration/node_modules/
 illustration/.next/
 illustration/out/
