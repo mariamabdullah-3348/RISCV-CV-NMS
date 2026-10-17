@@ -21,11 +21,11 @@ foreach(BENCHMARK_SOURCE ${BENCHMARK_SOURCES})
       RISCV_GEM5_FAIL_REGEX "Output is wrong")
     riscv_add_gem5_run(${BENCHMARK_NAME}_gem5)
 
-    riscv_add_linux_executable(${BENCHMARK_SOURCE})
-    target_link_libraries(${BENCHMARK_NAME}_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
-
-    target_include_directories(${BENCHMARK_NAME}_qemu PRIVATE
-      ${CMAKE_CURRENT_SOURCE_DIR}/include)
-
-    riscv_add_qemu_run(${BENCHMARK_NAME}_qemu)
+    if(BUILD_QEMU_TARGETS)
+      riscv_add_linux_executable(${BENCHMARK_SOURCE})
+      target_link_libraries(${BENCHMARK_NAME}_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
+      target_include_directories(${BENCHMARK_NAME}_qemu PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+      riscv_add_qemu_run(${BENCHMARK_NAME}_qemu)
+    endif()
 endforeach()

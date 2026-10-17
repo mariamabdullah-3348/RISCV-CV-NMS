@@ -28,11 +28,13 @@ target_link_libraries(unit_tests_gem5 PRIVATE ${CMAKE_PROJECT_NAME}_gem5 referen
 unit_test_includes(unit_tests_gem5)
 riscv_add_gem5_run(unit_tests_gem5)
 
-riscv_add_linux_executable(${TEST_MAIN})
-target_sources(unit_tests_qemu PRIVATE ${TEST_CASE_SOURCES})
-target_link_libraries(unit_tests_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
-unit_test_includes(unit_tests_qemu)
-riscv_add_qemu_run(unit_tests_qemu)
+if(BUILD_QEMU_TARGETS)
+  riscv_add_linux_executable(${TEST_MAIN})
+  target_sources(unit_tests_qemu PRIVATE ${TEST_CASE_SOURCES})
+  target_link_libraries(unit_tests_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
+  unit_test_includes(unit_tests_qemu)
+  riscv_add_qemu_run(unit_tests_qemu)
+endif()
 
 # ---- per-test-file images for focused runs ----------------------------------
 foreach(TEST_CASE_SOURCE ${TEST_CASE_SOURCES})
@@ -46,10 +48,12 @@ foreach(TEST_CASE_SOURCE ${TEST_CASE_SOURCES})
   set_target_properties(${TEST_NAME}_gem5 PROPERTIES RISCV_GEM5_NO_CTEST TRUE)
   riscv_add_gem5_run(${TEST_NAME}_gem5)
 
-  # QEMU image
-  riscv_add_linux_executable(${TEST_CASE_SOURCE})
-  target_sources(${TEST_NAME}_qemu PRIVATE ${TEST_MAIN})
-  target_link_libraries(${TEST_NAME}_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
-  unit_test_includes(${TEST_NAME}_qemu)
-  riscv_add_qemu_run(${TEST_NAME}_qemu)
+  # Optional QEMU image; gem5 is the required evaluation target.
+  if(BUILD_QEMU_TARGETS)
+    riscv_add_linux_executable(${TEST_CASE_SOURCE})
+    target_sources(${TEST_NAME}_qemu PRIVATE ${TEST_MAIN})
+    target_link_libraries(${TEST_NAME}_qemu PRIVATE ${CMAKE_PROJECT_NAME}_qemu reference_qemu)
+    unit_test_includes(${TEST_NAME}_qemu)
+    riscv_add_qemu_run(${TEST_NAME}_qemu)
+  endif()
 endforeach()

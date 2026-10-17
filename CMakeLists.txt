@@ -55,6 +55,7 @@ set(QEMU_BINARY "${QEMU_BINARY}" CACHE FILEPATH "qemu-riscv64 user-mode emulator
 set(QEMU_CPU "max"
     CACHE STRING "QEMU -cpu (max enables RVV + bitmanip/crypto used by RISCV_MARCH)")
 set(QEMU_EXTRA_ARGS "" CACHE STRING "Extra qemu-riscv64 arguments")
+option(BUILD_QEMU_TARGETS "Build optional QEMU user-mode targets (gem5 is the required evaluation target)" OFF)
 
 # RISC-V cross toolchain.
 set(RISCV_TOOLCHAIN_PREFIX "riscv64-linux-gnu-" CACHE STRING "GNU RISC-V toolchain triple prefix")
@@ -89,10 +90,10 @@ if(NOT EXISTS "${GEM5_CONFIG}")
     "Set -DGEM5_CONFIG=/path/to/kmhv3.py.")
 endif()
 
-if(NOT QEMU_BINARY OR NOT EXISTS "${QEMU_BINARY}")
+if(BUILD_QEMU_TARGETS AND (NOT QEMU_BINARY OR NOT EXISTS "${QEMU_BINARY}"))
   message(FATAL_ERROR
-    "QEMU_BINARY='${QEMU_BINARY}' does not exist.\n"
-    "Install qemu-user (apt install qemu-user) or set -DQEMU_BINARY=/path/to/qemu-riscv64.")
+    "BUILD_QEMU_TARGETS=ON but QEMU_BINARY='${QEMU_BINARY}' does not exist.\n"
+    "Install qemu-user or configure with -DBUILD_QEMU_TARGETS=OFF for gem5-only work.")
 endif()
 
 # ---- shared build settings ---------------------------------------------------
@@ -134,6 +135,7 @@ message(STATUS "RISC-V-CV configuration:")
 message(STATUS "  NEXUS_AM_HOME   = ${NEXUS_AM_HOME}")
 message(STATUS "  GEM5_BINARY     = ${GEM5_BINARY}")
 message(STATUS "  GEM5_CONFIG     = ${GEM5_CONFIG}")
+message(STATUS "  BUILD_QEMU_TARGETS = ${BUILD_QEMU_TARGETS}")
 message(STATUS "  QEMU_BINARY     = ${QEMU_BINARY}")
 message(STATUS "  QEMU_CPU        = ${QEMU_CPU}")
 message(STATUS "  AM_ARCH         = ${AM_ARCH}")
