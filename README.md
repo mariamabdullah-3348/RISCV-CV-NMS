@@ -127,7 +127,7 @@ The project includes unit tests and Python golden-reference utilities. See [`tes
 
 ## Build output and Git
 
-The `build/` directory contains generated CMake files, object files, executables, logs, and gem5 output. **Do not commit it.** It is reproducible from the source and build instructions above, can be large, and often contains absolute paths specific to one machine. The repository `.gitignore` excludes it and the generated gem5 summary CSV/text files.
+The `build/` directory contains generated CMake files, object files, executables, logs, and gem5 output. 
 
 ## Repository files
 
