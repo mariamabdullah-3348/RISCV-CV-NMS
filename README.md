@@ -90,6 +90,7 @@ rvv::LoadF32M4       → load VLMAX scores
 rvv::MaskF32GreaterEqualScalarM4 → mask = score >= threshold
 rvv::IotaU32M4 + rvv::AddU32M4  → absolute index vector
 rvv::CompressU32M4   → pack valid indices to front
+rvv::CompressF32M4   → pack valid scores to front
 rvv::CountTrueF32M4  → how many kept
 ```
 
@@ -97,16 +98,22 @@ Without a threshold, we skip the compare and use a pure iota-based fill.
 
 ### 3b. Sorting – Odd-Even Sort (Vectorized)
 
-The same pass structure as the scalar version. Each phase:
-- Load pairs of scores
-- Compare → mask
-- Merge indices and scores using the mask
+Follows the [riscv-illustration walkthrough](https://riscv-illustration.vercel.app/nms/walkthrough):
+- **Even phase first:** compare pairs `(0,1), (2,3), (4,5)...`
+- **Odd phase second:** compare pairs `(1,2), (3,4), (5,6)...`
+- **Swap condition:** `left_score < right_score` (enforces descending order while strictly preserving tie scores).
+- **Early termination:** exits if no swaps occur across a full iteration.
 
-The vectorized sort handles `n` elements across multiple vector lanes per iteration, reducing the number of scalar swap operations from `O(n²)` to `O(n²/VLMAX)` in the comparison phase.
+### 3c. Structure-of-Arrays (SoA) Corner Packing
 
-### 3c. IoU Suppression (Vectorized)
+Packs surviving box corners into four separate contiguous buffers aligned with `order[]`:
+- `soa_y1[]`, `soa_x1[]`, `soa_y2[]`, `soa_x2[]`
 
-For each kept box `i`, compute IoU of *all* remaining candidates `j > i` in one vectorized pass:
+This eliminates strided memory gathers during the IoU step and enables high-throughput vector loads (`rvv::LoadF32M2`).
+
+### 3d. IoU Suppression (Vectorized)
+
+For each kept box `i`, compute IoU against *all* remaining candidates `j > i` in vector lanes:
 
 ```
 rvv::MaxF32ScalarM2 / MinF32ScalarM2 → clamp intersection corners
@@ -124,38 +131,37 @@ This reduces the IoU inner loop from `O(n)` scalar iterations to `O(n/VLMAX)` ve
 
 ### Odd-Even Sort vs. Bitonic Sort
 
-| Property | Odd-Even Transposition Sort | Bitonic Sort |
+| Property | Odd-Even Transposition Sort | Bitonic Sorting Network |
 |---|---|---|
 | **Comparators** | O(n²) | O(n log²n) |
 | **Passes** | Up to n passes, early exit | Fixed log²n rounds |
-| **Stable** | Yes (natural stability) | No (arbitrary network) |
+| **Stable** | Yes (natural stability) | No (unstable by default) |
 | **Parallelism** | Each phase fully data-parallel | Each round fully data-parallel |
-| **Cache** | Sequential (good locality) | Strided (poor locality for large n) |
-| **Best for RISC-V** | Small n (< VLMAX), SIMD-friendly | Large n, power-of-2 |
+| **Memory Locality** | Sequential & contiguous | Strided / power-of-2 shuffles |
+| **Best For** | Small n (< 100), nearly-sorted inputs | Large n (n ≥ 64), power-of-2 batches |
 
-**In practice for NMS:**
-- `n` (candidates per class) is often small (< 100)
-- Odd-even sort with early exit terminates in far fewer than n passes for nearly-sorted inputs
-- Bitonic sort always executes all `log²n` rounds regardless
-- RISC-V's long vectors make each pass cheap → odd-even wins for typical NMS workloads
-
-**Benchmark Results** (measured on RISC-V target via `run_NMS_benchmark_qemu`):
+**Measured Benchmark Results** (executed on RISC-V target via `cmake --build build --target run_NMS_benchmark_qemu`):
 
 ```
 NMS benchmark: 80 boxes, 5 iterations
 NMS odd-even-sort (scalar vs vectorized):
-  reference  : 740359 cycles, 740940 instructions
-  vectorized : 3815904 cycles, 3816301 instructions
-  speedup    : 0.19x
+  reference  : 918,158 cycles, 917,716 instructions
+  vectorized : 4,465,724 cycles, 4,466,161 instructions
+  speedup    : 0.20x
 
 NMS heavy (overlapping 64 boxes, scalar vs vectorized):
-  reference  : 482298 cycles, 479183 instructions
-  vectorized : 2523204 cycles, 2523273 instructions
-  speedup    : 0.19x
+  reference  : 552,846 cycles, 547,821 instructions
+  vectorized : 3,242,994 cycles, 3,244,107 instructions
+  speedup    : 0.17x
+
+Sort comparison: Odd-Even vs. Bitonic (64 candidates):
+  reference (Odd-Even) : 230,531 cycles, 230,502 instructions
+  vectorized (Bitonic) : 28,551 cycles, 28,656 instructions
+  speedup              : 8.07x
 Output is correct.
 ```
 
-> The benchmark is in [`benchmark/source/NMS_benchmark.cpp`](benchmark/source/NMS_benchmark.cpp).
+> Standalone sorting algorithms and full NMS benchmarks are located in [`benchmark/source/NMS_benchmark.cpp`](benchmark/source/NMS_benchmark.cpp).
 
 ---
 
